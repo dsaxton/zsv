@@ -9,10 +9,18 @@ Written in Zig.
 Requires [Zig](https://ziglang.org/) 0.14.1.
 
 ```
-zig build
+zig build -Doptimize=ReleaseFast
 ```
 
 The binary is placed at `zig-out/bin/zsv`.
+
+`ReleaseFast` is recommended for production use. `ReleaseSmall` produces a much smaller binary (~56 KB vs ~2.3 MB) but is 5-6x slower. The default (debug) build is significantly slower than either release mode.
+
+Run the test suite:
+
+```
+zig build test
+```
 
 ## Usage
 
@@ -58,6 +66,12 @@ Filter rows:
 zsv -f "age>30" < data.csv
 ```
 
+Spaces around the operator are allowed:
+
+```sh
+zsv -f "Total Amount > 0.1" < data.csv
+```
+
 Combine select and filter:
 
 ```sh
@@ -76,7 +90,7 @@ Table with select and filter:
 zsv -t -s name,salary -f "salary>=100000" < employees.csv
 ```
 
-Column widths are estimated by buffering up to 1 MB of row data. Later values that exceed the estimated width are not truncated but may cause misalignment.
+Column widths are estimated by buffering up to 1 MB of row data. Later values that exceed the estimated width are not truncated but may cause misalignment. Multi-byte UTF-8 characters are measured by display column (codepoint count), not byte length, so non-ASCII text aligns correctly.
 
 Glob filter (prefix match):
 
@@ -123,6 +137,8 @@ curl -s https://example.com/data.csv | zsv -f "status=active" -s id,name | wc -l
 | `~` | Glob match (`*` matches any sequence of characters) |
 
 The `~` operator is always string-based and supports `*` wildcards: `name~Alice` (exact), `city~New*` (prefix), `city~*York` (suffix), `city~*ew*` (contains). All other filters attempt numeric comparison first. If both sides parse as numbers, the comparison is numeric; otherwise it falls back to lexicographic string comparison.
+
+Column names with spaces work in filter expressions. Whitespace around the operator is trimmed, so `"Total Amount > 100"` correctly references the column `Total Amount`.
 
 ## Limitations
 
