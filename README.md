@@ -1,0 +1,144 @@
+# zsv
+
+A fast, constant-memory CSV processor. Reads CSV from stdin, applies column selection and row filtering, and writes results to stdout.
+
+Written in Zig.
+
+## Build
+
+Requires [Zig](https://ziglang.org/) 0.14.1.
+
+```
+zig build
+```
+
+The binary is placed at `zig-out/bin/zsv`.
+
+## Usage
+
+```
+zsv [OPTIONS]
+```
+
+All input is read from stdin and output is written to stdout.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `-s, --select FIELDS` | Comma-separated column names or 1-based indices |
+| `-f, --filter EXPR` | Filter expression (repeatable; multiple filters are ANDed) |
+| `-t, --table` | Pretty-print output as an aligned table |
+| `--no-header` | Suppress header row in output |
+| `-h, --help` | Print help message |
+
+### Examples
+
+Pass through a CSV file:
+
+```sh
+zsv < data.csv
+```
+
+Select specific columns by name:
+
+```sh
+zsv -s name,age < data.csv
+```
+
+Select by 1-based index:
+
+```sh
+zsv -s 1,3 < data.csv
+```
+
+Filter rows:
+
+```sh
+zsv -f "age>30" < data.csv
+```
+
+Combine select and filter:
+
+```sh
+zsv -s name,salary -f "department=Engineering" -f "salary>=100000" < employees.csv
+```
+
+Pretty-print as a table:
+
+```sh
+zsv -t < data.csv
+```
+
+Table with select and filter:
+
+```sh
+zsv -t -s name,salary -f "salary>=100000" < employees.csv
+```
+
+Column widths are estimated by buffering up to 1 MB of row data. Later values that exceed the estimated width are not truncated but may cause misalignment.
+
+Glob filter (prefix match):
+
+```sh
+zsv -f "city~New*" < data.csv
+```
+
+Glob filter (contains):
+
+```sh
+zsv -f "city~*York*" < data.csv
+```
+
+Suppress the header row:
+
+```sh
+zsv --no-header -s name < data.csv
+```
+
+Page through results with `less`:
+
+```sh
+zsv -t < data.csv | less -S
+```
+
+The `-S` flag disables line wrapping, which keeps table columns aligned.
+
+Pipe with other tools:
+
+```sh
+curl -s https://example.com/data.csv | zsv -f "status=active" -s id,name | wc -l
+```
+
+### Filter operators
+
+| Operator | Meaning |
+|---|---|
+| `=` | Equal |
+| `!=` | Not equal |
+| `<` | Less than |
+| `>` | Greater than |
+| `<=` | Less than or equal |
+| `>=` | Greater than or equal |
+| `~` | Glob match (`*` matches any sequence of characters) |
+
+The `~` operator is always string-based and supports `*` wildcards: `name~Alice` (exact), `city~New*` (prefix), `city~*York` (suffix), `city~*ew*` (contains). All other filters attempt numeric comparison first. If both sides parse as numbers, the comparison is numeric; otherwise it falls back to lexicographic string comparison.
+
+## Limitations
+
+- Input must be read from stdin (no filename argument).
+- The first row is always treated as a header. There is no headerless-input mode.
+- Maximum line length is 1 MB. Lines exceeding this limit produce an error.
+- Newlines within quoted fields are not supported (the parser splits on `\n` before parsing fields).
+- Empty lines in the input are silently skipped.
+- Filter values cannot contain the operator characters (`=`, `<`, `>`, `!`, `~`) since the parser splits on the first operator it finds in the expression.
+
+## Possible future enhancements
+
+- Read from a file argument instead of only stdin.
+- Custom field delimiter (`-d '\t'` for TSV, `-d '|'` for pipe-delimited, etc.).
+- Limit output to the first N rows (`--head N`).
+- Case-insensitive filtering.
+- Sorting by one or more columns.
+- Count matching rows (`--count`).
+- Support newlines within quoted fields (multi-line records).
