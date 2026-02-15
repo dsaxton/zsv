@@ -36,6 +36,8 @@ All input is read from stdin and output is written to stdout.
 |---|---|
 | `-s, --select FIELDS` | Comma-separated column names or 1-based indices |
 | `-f, --filter EXPR` | Filter expression (repeatable; multiple filters are ANDed) |
+| `-n, --head N` | Output first N data rows (after filtering) |
+| `--top FIELD` | Output top rows by FIELD (descending). Use with `-n` to set count (default 10) |
 | `-t, --table` | Pretty-print output as an aligned table |
 | `--no-header` | Suppress header row in output |
 | `-h, --help` | Print help message |
@@ -64,6 +66,18 @@ Filter rows:
 
 ```sh
 zsv -f "age>30" < data.csv
+```
+
+Head (first N matching rows):
+
+```sh
+zsv -n 100 -f "status=active" < data.csv
+```
+
+Top N by a column (descending):
+
+```sh
+zsv --top salary -n 20 -s name,salary < employees.csv
 ```
 
 Spaces around the operator are allowed:
@@ -150,6 +164,7 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 - Empty lines in the input are silently skipped.
 - Filter values cannot contain the operator characters (`=`, `<`, `>`, `!`, `~`) since the parser splits on the first operator it finds in the expression.
 - In transform modes (`--select`, `--filter`, or `--table`), malformed quoted fields (e.g. unterminated quotes or non-delimiter content after a closing quote) produce an error.
+- `--top` is not currently supported with `--table`.
 
 ## Error handling
 
@@ -160,7 +175,6 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 
 - Read from a file argument instead of only stdin.
 - Custom field delimiter (`-d '\t'` for TSV, `-d '|'` for pipe-delimited, etc.).
-- Limit output to the first N rows (`--head N`).
 - Case-insensitive filtering.
 - Sorting by one or more columns.
 - Count matching rows (`--count`).
