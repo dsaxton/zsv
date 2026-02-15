@@ -27,6 +27,8 @@ const Filter = struct {
 const Config = struct {
     selectors: ?[]const []const u8 = null,
     filters: ?[]Filter = null,
+    head: ?usize = null,
+    top_field: ?[]const u8 = null,
     no_header: bool = false,
     table: bool = false,
 };
@@ -56,6 +58,8 @@ fn printUsage(writer: anytype) !void {
         \\  -f, --filter EXPR     Filter expression: field op value
         \\                        Operators: =, !=, <, >, <=, >=, ~ (glob)
         \\                        Repeatable (multiple filters = AND)
+        \\  -n, --head N          Output first N data rows (after filtering)
+        \\      --top FIELD       Output top rows by FIELD (desc); use -n for count
         \\  -t, --table           Pretty-print as aligned table
         \\      --no-header       Suppress header row in output
         \\  -h, --help            Print this help message
@@ -71,6 +75,8 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
 
     var selectors = std.ArrayList([]const u8).init(allocator);
     var filters = std.ArrayList(Filter).init(allocator);
+    var head: ?usize = null;
+    var top_field: ?[]const u8 = null;
     var no_header = false;
     var table = false;
 
@@ -107,6 +113,24 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
                 return null;
             };
             try filters.append(filter);
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--head")) {
+            const value = args_iter.next() orelse {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.writeAll("Error: --head requires an argument\n");
+                return null;
+            };
+            head = std.fmt.parseInt(usize, value, 10) catch {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error: invalid --head value: {s}\n", .{value});
+                return null;
+            };
+        } else if (std.mem.eql(u8, arg, "--top")) {
+            const value = args_iter.next() orelse {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.writeAll("Error: --top requires an argument\n");
+                return null;
+            };
+            top_field = value;
         } else {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("Error: unknown argument: {s}\n", .{arg});
@@ -118,6 +142,8 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
     return Config{
         .selectors = if (selectors.items.len > 0) selectors.items else null,
         .filters = if (filters.items.len > 0) filters.items else null,
+        .head = head,
+        .top_field = top_field,
         .no_header = no_header,
         .table = table,
     };
@@ -417,6 +443,55 @@ fn writeRecordWithQuotedMask(writer: anytype, fields: []const []const u8, quoted
         }
     }
     try writer.writeByte('\n');
+}
+
+const TopRow = struct {
+    fields: []const []const u8,
+    key: []const u8,
+    key_num: ?f64,
+};
+
+fn compareTopKeys(a_num: ?f64, a: []const u8, b_num: ?f64, b: []const u8) std.math.Order {
+    if (a_num != null and b_num != null) {
+        return std.math.order(a_num.?, b_num.?);
+    }
+    return std.mem.order(u8, a, b);
+}
+
+fn cloneFields(allocator: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
+    const duped = try allocator.alloc([]const u8, fields.len);
+    errdefer allocator.free(duped);
+
+    var i: usize = 0;
+    errdefer {
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            allocator.free(duped[j]);
+        }
+    }
+    while (i < fields.len) : (i += 1) {
+        const field = fields[i];
+        duped[i] = try allocator.dupe(u8, field);
+    }
+    return duped;
+}
+
+fn freeClonedFields(allocator: std.mem.Allocator, fields: []const []const u8) void {
+    for (fields) |field| {
+        allocator.free(field);
+    }
+    allocator.free(fields);
+}
+
+fn worstTopIndex(rows: []const TopRow) usize {
+    var worst: usize = 0;
+    var i: usize = 1;
+    while (i < rows.len) : (i += 1) {
+        if (compareTopKeys(rows[i].key_num, rows[i].key, rows[worst].key_num, rows[worst].key) == .lt) {
+            worst = i;
+        }
+    }
+    return worst;
 }
 
 fn displayWidth(s: []const u8) usize {
@@ -747,6 +822,24 @@ test "passesFilters: multiple filters ANDed" {
     try std.testing.expect(!passesFilters(&filters, &fields));
 }
 
+test "compareTopKeys: numeric and string ordering" {
+    try std.testing.expect(compareTopKeys(5, "5", 3, "3") == .gt);
+    try std.testing.expect(compareTopKeys(null, "b", null, "a") == .gt);
+    try std.testing.expect(compareTopKeys(10, "10", null, "9") == .lt);
+}
+
+test "worstTopIndex: returns minimum key row index" {
+    const f1 = [_][]const u8{"x"};
+    const f2 = [_][]const u8{"y"};
+    const f3 = [_][]const u8{"z"};
+    const rows = [_]TopRow{
+        .{ .fields = &f1, .key = "10", .key_num = 10 },
+        .{ .fields = &f2, .key = "3", .key_num = 3 },
+        .{ .fields = &f3, .key = "7", .key_num = 7 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), worstTopIndex(&rows));
+}
+
 test "displayWidth: ASCII string" {
     try std.testing.expectEqual(@as(usize, 5), displayWidth("hello"));
 }
@@ -891,6 +984,11 @@ pub fn main() !void {
     const prog_alloc = prog_arena.allocator();
 
     const config = try parseArgs(prog_alloc) orelse return;
+    if (config.table and config.top_field != null) {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.writeAll("Error: --top is not supported with --table\n");
+        std.process.exit(1);
+    }
 
     const stdin = std.io.getStdIn();
     var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
@@ -911,17 +1009,22 @@ pub fn main() !void {
         try stderr.writeAll("Error reading header: line too long\n");
         return;
     } orelse return;
+    var rows_written: usize = 0;
 
-    if (!config.table and config.selectors == null and config.filters == null) {
+    if (!config.table and config.selectors == null and config.filters == null and config.top_field == null) {
         if (!config.no_header) {
             try writer.writeAll(header_line);
             try writer.writeByte('\n');
         }
 
         while (true) {
+            if (config.head) |limit| {
+                if (rows_written >= limit) break;
+            }
             const line = readNextLine(&reader, &line_buf) catch break orelse break;
             try writer.writeAll(line);
             try writer.writeByte('\n');
+            rows_written += 1;
         }
 
         try bw.flush();
@@ -953,6 +1056,70 @@ pub fn main() !void {
         }
     }
 
+    const top_col_index: ?usize = if (config.top_field) |name| try resolveColumnIndex(header, name) else null;
+
+    if (top_col_index) |top_idx| {
+        const limit = config.head orelse 10;
+        if (!config.no_header) {
+            try writeRecord(writer, header, col_indices);
+        }
+        if (limit == 0) {
+            try bw.flush();
+            return;
+        }
+
+        var top_rows = std.ArrayList(TopRow).init(allocator);
+        defer {
+            for (top_rows.items) |row| {
+                freeClonedFields(allocator, row.fields);
+            }
+            top_rows.deinit();
+        }
+
+        while (true) {
+            const line = readNextLine(&reader, &line_buf) catch break orelse break;
+            line_no += 1;
+            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
+                std.process.exit(1);
+            };
+
+            if (!passesFilters(config.filters, result.fields)) continue;
+
+            const key = if (top_idx < result.fields.len) result.fields[top_idx] else "";
+            const key_num = std.fmt.parseFloat(f64, key) catch null;
+
+            if (top_rows.items.len < limit) {
+                const duped = try cloneFields(allocator, result.fields);
+                const duped_key = if (top_idx < duped.len) duped[top_idx] else "";
+                try top_rows.append(.{ .fields = duped, .key = duped_key, .key_num = key_num });
+            } else {
+                const wi = worstTopIndex(top_rows.items);
+                const worst = top_rows.items[wi];
+                if (compareTopKeys(key_num, key, worst.key_num, worst.key) == .gt) {
+                    const duped = try cloneFields(allocator, result.fields);
+                    const duped_key = if (top_idx < duped.len) duped[top_idx] else "";
+                    freeClonedFields(allocator, worst.fields);
+                    top_rows.items[wi] = .{ .fields = duped, .key = duped_key, .key_num = key_num };
+                }
+            }
+        }
+
+        std.sort.pdq(TopRow, top_rows.items, {}, struct {
+            fn lessThan(_: void, a: TopRow, b: TopRow) bool {
+                return compareTopKeys(a.key_num, a.key, b.key_num, b.key) == .gt;
+            }
+        }.lessThan);
+
+        for (top_rows.items) |row| {
+            try writeRecord(writer, row.fields, col_indices);
+        }
+
+        try bw.flush();
+        return;
+    }
+
     if (config.table) {
         const num_output_cols = if (col_indices) |ci| ci.len else header.len;
 
@@ -971,6 +1138,9 @@ pub fn main() !void {
         var sample_bytes: usize = 0;
 
         while (sample_bytes < table_sample_budget) {
+            if (config.head) |limit| {
+                if (buffered_rows.items.len >= limit) break;
+            }
             const line = readNextLine(&reader, &line_buf) catch break orelse break;
             line_no += 1;
             const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
@@ -1011,10 +1181,17 @@ pub fn main() !void {
         }
 
         for (buffered_rows.items) |row| {
+            if (config.head) |limit| {
+                if (rows_written >= limit) break;
+            }
             try writeTableRow(writer, row, col_indices, widths);
+            rows_written += 1;
         }
 
         while (true) {
+            if (config.head) |limit| {
+                if (rows_written >= limit) break;
+            }
             const line = readNextLine(&reader, &line_buf) catch break orelse break;
             line_no += 1;
             const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
@@ -1025,6 +1202,7 @@ pub fn main() !void {
 
             if (passesFilters(config.filters, result.fields)) {
                 try writeTableRow(writer, result.fields, col_indices, widths);
+                rows_written += 1;
             }
         }
     } else {
@@ -1033,6 +1211,9 @@ pub fn main() !void {
         }
 
         while (true) {
+            if (config.head) |limit| {
+                if (rows_written >= limit) break;
+            }
             const line = readNextLine(&reader, &line_buf) catch break orelse break;
             line_no += 1;
             const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
@@ -1043,6 +1224,7 @@ pub fn main() !void {
 
             if (passesFilters(config.filters, result.fields)) {
                 try writeRecordWithQuotedMask(writer, result.fields, result.quoted, col_indices);
+                rows_written += 1;
             }
         }
     }
