@@ -20,6 +20,8 @@ const Filter = struct {
     op: FilterOp,
     value: []const u8,
     col_index: ?usize = null,
+    value_num_parsed: bool = false,
+    value_num: ?f64 = null,
 };
 
 const Config = struct {
@@ -28,6 +30,20 @@ const Config = struct {
     no_header: bool = false,
     table: bool = false,
 };
+
+const ParseRecordError = error{
+    TooManyFields,
+    UnterminatedQuote,
+    MalformedQuotedField,
+};
+
+fn parseRecordErrorMessage(err: ParseRecordError) []const u8 {
+    return switch (err) {
+        error.TooManyFields => "too many fields in row",
+        error.UnterminatedQuote => "unterminated quoted field",
+        error.MalformedQuotedField => "malformed quoted field",
+    };
+}
 
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
@@ -123,10 +139,13 @@ fn parseFilter(expr: []const u8) ?Filter {
             if (pos == 0) continue; // No field name.
             const field = std.mem.trim(u8, expr[0..pos], " ");
             const value = std.mem.trim(u8, expr[pos + entry.text.len ..], " ");
+            const value_num = std.fmt.parseFloat(f64, value) catch null;
             return Filter{
                 .field = field,
                 .op = entry.op,
                 .value = value,
+                .value_num_parsed = true,
+                .value_num = value_num,
             };
         }
     }
@@ -135,19 +154,23 @@ fn parseFilter(expr: []const u8) ?Filter {
 
 /// Parses a CSV line into fields. Returns slices into `line` for unquoted fields
 /// and slices into `quote_buf` for quoted fields containing escaped quotes.
-fn parseRecord(line: []const u8, out: [][]const u8, quote_buf: []u8) struct { fields: [][]const u8, quote_buf_used: usize } {
+fn parseRecord(line: []const u8, out: [][]const u8, quoted: []bool, quote_buf: []u8) ParseRecordError!struct { fields: [][]const u8, quoted: []const bool, quote_buf_used: usize } {
     var n: usize = 0;
     var qb_used: usize = 0;
     var i: usize = 0;
 
-    while (i <= line.len and n < out.len) {
+    while (i <= line.len) {
         if (i == line.len) {
             if (line.len > 0 and line[line.len - 1] == ',') {
+                if (n >= out.len) return error.TooManyFields;
                 out[n] = "";
+                quoted[n] = false;
                 n += 1;
             }
             break;
         }
+
+        if (n >= out.len) return error.TooManyFields;
 
         if (line[i] == '"') {
             i += 1;
@@ -166,19 +189,25 @@ fn parseRecord(line: []const u8, out: [][]const u8, quote_buf: []u8) struct { fi
                     scan += 1;
                 }
             }
+            if (scan >= line.len) return error.UnterminatedQuote;
+
             if (!has_escapes) {
                 // Fast path: slice directly into line.
                 out[n] = line[i..scan];
+                quoted[n] = true;
                 n += 1;
-                i = if (scan < line.len) scan + 1 else scan; // skip closing quote
-                if (i < line.len and line[i] == ',') {
+                i = scan + 1; // skip closing quote
+                if (i == line.len) {
+                    break;
+                } else if (line[i] == ',') {
                     i += 1;
                 } else {
-                    break;
+                    return error.MalformedQuotedField;
                 }
             } else {
                 // Slow path: copy unescaped content into quote_buf.
                 const start = qb_used;
+                var closed = false;
                 while (i < line.len) {
                     if (line[i] == '"') {
                         if (i + 1 < line.len and line[i + 1] == '"') {
@@ -189,6 +218,7 @@ fn parseRecord(line: []const u8, out: [][]const u8, quote_buf: []u8) struct { fi
                             i += 2;
                         } else {
                             i += 1;
+                            closed = true;
                             break;
                         }
                     } else {
@@ -199,18 +229,23 @@ fn parseRecord(line: []const u8, out: [][]const u8, quote_buf: []u8) struct { fi
                         i += 1;
                     }
                 }
+                if (!closed) return error.UnterminatedQuote;
                 out[n] = quote_buf[start..qb_used];
+                quoted[n] = true;
                 n += 1;
-                if (i < line.len and line[i] == ',') {
+                if (i == line.len) {
+                    break;
+                } else if (line[i] == ',') {
                     i += 1;
                 } else {
-                    break;
+                    return error.MalformedQuotedField;
                 }
             }
         } else {
             const start = i;
             while (i < line.len and line[i] != ',') : (i += 1) {}
             out[n] = line[start..i];
+            quoted[n] = false;
             n += 1;
             if (i < line.len) {
                 i += 1;
@@ -220,9 +255,8 @@ fn parseRecord(line: []const u8, out: [][]const u8, quote_buf: []u8) struct { fi
         }
     }
 
-    return .{ .fields = out[0..n], .quote_buf_used = qb_used };
+    return .{ .fields = out[0..n], .quoted = quoted[0..n], .quote_buf_used = qb_used };
 }
-
 
 fn resolveColumnIndex(header: []const []const u8, selector: []const u8) !usize {
     if (std.fmt.parseInt(usize, selector, 10)) |idx| {
@@ -282,21 +316,36 @@ fn evaluateFilter(filter: *const Filter, fields: []const []const u8) bool {
         return globMatch(filter_val, field_val);
     }
 
-    const field_num = std.fmt.parseFloat(f64, field_val) catch null;
-    const filter_num = std.fmt.parseFloat(f64, filter_val) catch null;
-
-    if (field_num != null and filter_num != null) {
-        const a = field_num.?;
-        const b = filter_num.?;
-        return switch (filter.op) {
-            .eq => a == b,
-            .neq => a != b,
-            .lt => a < b,
-            .gt => a > b,
-            .lte => a <= b,
-            .gte => a >= b,
-            .like => unreachable,
-        };
+    if (filter.value_num_parsed and filter.value_num != null) {
+        const b = filter.value_num.?;
+        const field_num = std.fmt.parseFloat(f64, field_val) catch null;
+        if (field_num) |a| {
+            return switch (filter.op) {
+                .eq => a == b,
+                .neq => a != b,
+                .lt => a < b,
+                .gt => a > b,
+                .lte => a <= b,
+                .gte => a >= b,
+                .like => unreachable,
+            };
+        }
+    } else if (!filter.value_num_parsed) {
+        const field_num = std.fmt.parseFloat(f64, field_val) catch null;
+        const filter_num = std.fmt.parseFloat(f64, filter_val) catch null;
+        if (field_num != null and filter_num != null) {
+            const a = field_num.?;
+            const b = filter_num.?;
+            return switch (filter.op) {
+                .eq => a == b,
+                .neq => a != b,
+                .lt => a < b,
+                .gt => a > b,
+                .lte => a <= b,
+                .gte => a >= b,
+                .like => unreachable,
+            };
+        }
     }
 
     const order = std.mem.order(u8, field_val, filter_val);
@@ -340,6 +389,31 @@ fn writeRecord(writer: anytype, fields: []const []const u8, col_indices: ?[]cons
         for (fields, 0..) |field, i| {
             if (i > 0) try writer.writeByte(',');
             try writeField(writer, field);
+        }
+    }
+    try writer.writeByte('\n');
+}
+
+fn writeRecordWithQuotedMask(writer: anytype, fields: []const []const u8, quoted: []const bool, col_indices: ?[]const usize) !void {
+    if (col_indices) |indices| {
+        for (indices, 0..) |ci, i| {
+            if (i > 0) try writer.writeByte(',');
+            if (ci < fields.len) {
+                if (quoted[ci]) {
+                    try writeField(writer, fields[ci]);
+                } else {
+                    try writer.writeAll(fields[ci]);
+                }
+            }
+        }
+    } else {
+        for (fields, 0..) |field, i| {
+            if (i > 0) try writer.writeByte(',');
+            if (quoted[i]) {
+                try writeField(writer, field);
+            } else {
+                try writer.writeAll(field);
+            }
         }
     }
     try writer.writeByte('\n');
@@ -443,7 +517,8 @@ fn testParseRecord(line: []const u8) TestParseResult {
     var result: TestParseResult = undefined;
     result.out = undefined;
     result.qbuf = undefined;
-    const r = parseRecord(line, &result.out, &result.qbuf);
+    var quoted: [max_fields]bool = undefined;
+    const r = parseRecord(line, &result.out, &quoted, &result.qbuf) catch unreachable;
     result.fields = r.fields;
     result.quote_buf_used = r.quote_buf_used;
     return result;
@@ -617,7 +692,7 @@ test "evaluateFilter: numeric comparison" {
 }
 
 test "evaluateFilter: numeric equality" {
-    const fields = [_][]const u8{ "42" };
+    const fields = [_][]const u8{"42"};
     var f = Filter{ .field = "x", .op = .eq, .value = "42", .col_index = 0 };
     try std.testing.expect(evaluateFilter(&f, &fields));
 
@@ -626,7 +701,7 @@ test "evaluateFilter: numeric equality" {
 }
 
 test "evaluateFilter: string comparison fallback" {
-    const fields = [_][]const u8{ "banana" };
+    const fields = [_][]const u8{"banana"};
     var f = Filter{ .field = "fruit", .op = .gt, .value = "apple", .col_index = 0 };
     try std.testing.expect(evaluateFilter(&f, &fields));
 
@@ -635,7 +710,7 @@ test "evaluateFilter: string comparison fallback" {
 }
 
 test "evaluateFilter: glob operator" {
-    const fields = [_][]const u8{ "bc-west" };
+    const fields = [_][]const u8{"bc-west"};
     var f = Filter{ .field = "dest", .op = .like, .value = "bc*", .col_index = 0 };
     try std.testing.expect(evaluateFilter(&f, &fields));
 
@@ -774,6 +849,38 @@ test "readNextLine: returns null on empty input" {
     try std.testing.expect(try readNextLine(&reader, &buf) == null);
 }
 
+test "parseRecord: malformed quoted field returns error" {
+    var out: [max_fields][]const u8 = undefined;
+    var quoted: [max_fields]bool = undefined;
+    var qbuf: [4096]u8 = undefined;
+    try std.testing.expectError(error.MalformedQuotedField, parseRecord("\"x\"oops,2,3", &out, &quoted, &qbuf));
+}
+
+test "parseRecord: unterminated quoted field returns error" {
+    var out: [max_fields][]const u8 = undefined;
+    var quoted: [max_fields]bool = undefined;
+    var qbuf: [4096]u8 = undefined;
+    try std.testing.expectError(error.UnterminatedQuote, parseRecord("\"abc,def", &out, &quoted, &qbuf));
+}
+
+test "parseRecord: too many fields returns error" {
+    var line_buf: [max_fields * 2 + 16]u8 = undefined;
+    var pos: usize = 0;
+    for (0..(max_fields + 1)) |i| {
+        line_buf[pos] = 'x';
+        pos += 1;
+        if (i != max_fields) {
+            line_buf[pos] = ',';
+            pos += 1;
+        }
+    }
+
+    var out: [max_fields][]const u8 = undefined;
+    var quoted: [max_fields]bool = undefined;
+    var qbuf: [4096]u8 = undefined;
+    try std.testing.expectError(error.TooManyFields, parseRecord(line_buf[0..pos], &out, &quoted, &qbuf));
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -796,6 +903,7 @@ pub fn main() !void {
     // Stack-allocated line buffer and field/quote scratch space.
     var line_buf: [max_line_len]u8 = undefined;
     var field_buf: [max_fields][]const u8 = undefined;
+    var quoted_buf: [max_fields]bool = undefined;
     var quote_buf: [max_line_len]u8 = undefined;
 
     const header_line = readNextLine(&reader, &line_buf) catch {
@@ -804,10 +912,31 @@ pub fn main() !void {
         return;
     } orelse return;
 
+    if (!config.table and config.selectors == null and config.filters == null) {
+        if (!config.no_header) {
+            try writer.writeAll(header_line);
+            try writer.writeByte('\n');
+        }
+
+        while (true) {
+            const line = readNextLine(&reader, &line_buf) catch break orelse break;
+            try writer.writeAll(line);
+            try writer.writeByte('\n');
+        }
+
+        try bw.flush();
+        return;
+    }
+
     // Header must be heap-duped since line_buf will be reused.
     const header_line_copy = try prog_alloc.dupe(u8, header_line);
-    const header_result = parseRecord(header_line_copy, &field_buf, &quote_buf);
+    const header_result = parseRecord(header_line_copy, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.print("Error parsing CSV header: {s}\n", .{parseRecordErrorMessage(err)});
+        std.process.exit(1);
+    };
     const header = try prog_alloc.dupe([]const u8, header_result.fields);
+    var line_no: usize = 1;
 
     var col_indices: ?[]usize = null;
     if (config.selectors) |selectors| {
@@ -843,7 +972,12 @@ pub fn main() !void {
 
         while (sample_bytes < table_sample_budget) {
             const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            const result = parseRecord(line, &field_buf, &quote_buf);
+            line_no += 1;
+            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
+                std.process.exit(1);
+            };
 
             if (passesFilters(config.filters, result.fields)) {
                 const duped = try prog_alloc.alloc([]const u8, result.fields.len);
@@ -882,7 +1016,12 @@ pub fn main() !void {
 
         while (true) {
             const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            const result = parseRecord(line, &field_buf, &quote_buf);
+            line_no += 1;
+            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
+                std.process.exit(1);
+            };
 
             if (passesFilters(config.filters, result.fields)) {
                 try writeTableRow(writer, result.fields, col_indices, widths);
@@ -895,10 +1034,15 @@ pub fn main() !void {
 
         while (true) {
             const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            const result = parseRecord(line, &field_buf, &quote_buf);
+            line_no += 1;
+            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
+                std.process.exit(1);
+            };
 
             if (passesFilters(config.filters, result.fields)) {
-                try writeRecord(writer, result.fields, col_indices);
+                try writeRecordWithQuotedMask(writer, result.fields, result.quoted, col_indices);
             }
         }
     }
