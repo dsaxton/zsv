@@ -145,9 +145,16 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 - Input must be read from stdin (no filename argument).
 - The first row is always treated as a header. There is no headerless-input mode.
 - Maximum line length is 1 MB. Lines exceeding this limit produce an error.
+- Maximum fields per row is 4096. Rows exceeding this limit produce an error.
 - Newlines within quoted fields are not supported (the parser splits on `\n` before parsing fields).
 - Empty lines in the input are silently skipped.
 - Filter values cannot contain the operator characters (`=`, `<`, `>`, `!`, `~`) since the parser splits on the first operator it finds in the expression.
+- In transform modes (`--select`, `--filter`, or `--table`), malformed quoted fields (e.g. unterminated quotes or non-delimiter content after a closing quote) produce an error.
+
+## Error handling
+
+- CSV parse errors are reported to stderr with the line number and a short reason, and the process exits with a non-zero status.
+- The no-transform pass-through path (`zsv < file.csv` with no `--select`, `--filter`, or `--table`) streams lines without CSV field parsing, so malformed CSV rows are passed through as-is in that mode.
 
 ## Possible future enhancements
 
