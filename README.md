@@ -22,6 +22,20 @@ Run the test suite:
 zig build test
 ```
 
+Run only end-to-end CLI tests:
+
+```
+zig build test-e2e
+```
+
+If you use `just`, equivalent commands are:
+
+```
+just test
+just test-unit
+just test-e2e
+```
+
 ## Usage
 
 ```
