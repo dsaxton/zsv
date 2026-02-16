@@ -30,6 +30,14 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+
+    const run_e2e_tests = b.addSystemCommand(&.{ "bash", "tests/e2e_cli.sh" });
+    run_e2e_tests.addFileArg(exe.getEmittedBin());
+
+    const e2e_test_step = b.step("test-e2e", "Run end-to-end CLI tests");
+    e2e_test_step.dependOn(&run_e2e_tests.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+    test_step.dependOn(&run_e2e_tests.step);
 }

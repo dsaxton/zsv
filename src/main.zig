@@ -98,7 +98,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             var it = std.mem.splitScalar(u8, value, ',');
             while (it.next()) |field| {
                 if (field.len > 0) {
-                    try selectors.append(field);
+                    try selectors.append(try allocator.dupe(u8, field));
                 }
             }
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--filter")) {
@@ -109,11 +109,14 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             }
             i += 1;
             const value = args[i];
-            const filter = parseFilter(value) orelse {
+            const parsed_filter = parseFilter(value) orelse {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("Error: invalid filter expression: {s}\n", .{value});
                 return null;
             };
+            var filter = parsed_filter;
+            filter.field = try allocator.dupe(u8, parsed_filter.field);
+            filter.value = try allocator.dupe(u8, parsed_filter.value);
             try filters.append(filter);
         } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--head")) {
             if (i + 1 >= args.len) {
@@ -139,7 +142,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             }
             i += 1;
             const value = args[i];
-            top_field = value;
+            top_field = try allocator.dupe(u8, value);
         } else {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("Error: unknown argument: {s}\n", .{arg});
@@ -569,6 +572,67 @@ fn writeTableRow(writer: anytype, fields: []const []const u8, col_indices: ?[]co
     try writer.writeByte('\n');
 }
 
+fn writeTopRows(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    header: []const []const u8,
+    col_indices: ?[]const usize,
+    top_rows: []const TopRow,
+    table: bool,
+    no_header: bool,
+) !void {
+    if (table) {
+        const num_output_cols = if (col_indices) |ci| ci.len else header.len;
+        const widths = try allocator.alloc(usize, num_output_cols);
+        defer allocator.free(widths);
+
+        if (col_indices) |ci| {
+            for (ci, 0..) |c, i| {
+                widths[i] = if (c < header.len) displayWidth(header[c]) else 0;
+            }
+        } else {
+            for (header, 0..) |h, i| {
+                widths[i] = displayWidth(h);
+            }
+        }
+
+        for (top_rows) |row| {
+            if (col_indices) |ci| {
+                for (ci, 0..) |c, j| {
+                    if (c < row.fields.len) {
+                        const dw = displayWidth(row.fields[c]);
+                        if (dw > widths[j]) widths[j] = dw;
+                    }
+                }
+            } else {
+                for (row.fields, 0..) |val, j| {
+                    if (j < widths.len) {
+                        const dw = displayWidth(val);
+                        if (dw > widths[j]) widths[j] = dw;
+                    }
+                }
+            }
+        }
+
+        if (!no_header) {
+            try writeTableRow(writer, header, col_indices, widths);
+            try writeTableSeparator(writer, widths);
+        }
+
+        for (top_rows) |row| {
+            try writeTableRow(writer, row.fields, col_indices, widths);
+        }
+        return;
+    }
+
+    if (!no_header) {
+        try writeRecord(writer, header, col_indices);
+    }
+    for (top_rows) |row| {
+        try writeRecord(writer, row.fields, col_indices);
+    }
+}
+
 fn passesFilters(filters: ?[]Filter, fields: []const []const u8) bool {
     const ff = filters orelse return true;
     for (ff) |*f| {
@@ -964,6 +1028,47 @@ test "writeRecord: with column selection" {
     try std.testing.expectEqualStrings("c,a\n", fbs.getWritten());
 }
 
+test "writeTopRows: table mode emits one header row" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const header = [_][]const u8{ "name", "score" };
+    const row1_fields = [_][]const u8{ "Alice", "9" };
+    const row2_fields = [_][]const u8{ "Bob", "8" };
+    const rows = [_]TopRow{
+        .{ .fields = &row1_fields, .key = row1_fields[1], .key_num = 9.0 },
+        .{ .fields = &row2_fields, .key = row2_fields[1], .key_num = 8.0 },
+    };
+
+    try writeTopRows(std.testing.allocator, fbs.writer(), &header, null, &rows, true, false);
+    try std.testing.expectEqualStrings(
+        "name  | score\n" ++
+            "------+------\n" ++
+            "Alice | 9    \n" ++
+            "Bob   | 8    \n",
+        fbs.getWritten(),
+    );
+}
+
+test "writeTopRows: csv mode emits one header row" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const header = [_][]const u8{ "name", "score" };
+    const row1_fields = [_][]const u8{ "Alice", "9" };
+    const row2_fields = [_][]const u8{ "Bob", "8" };
+    const rows = [_]TopRow{
+        .{ .fields = &row1_fields, .key = row1_fields[1], .key_num = 9.0 },
+        .{ .fields = &row2_fields, .key = row2_fields[1], .key_num = 8.0 },
+    };
+
+    try writeTopRows(std.testing.allocator, fbs.writer(), &header, null, &rows, false, false);
+    try std.testing.expectEqualStrings(
+        "name,score\n" ++
+            "Alice,9\n" ++
+            "Bob,8\n",
+        fbs.getWritten(),
+    );
+}
+
 test "readNextLine: basic line" {
     var buf: [256]u8 = undefined;
     var stream = std.io.fixedBufferStream("hello\nworld\n");
@@ -1113,9 +1218,6 @@ pub fn main() !void {
 
     if (top_col_index) |top_idx| {
         const limit = config.head orelse default_head_rows;
-        if (!config.no_header) {
-            try writeRecord(writer, header, col_indices);
-        }
         if (limit == 0) {
             try bw.flush();
             return;
@@ -1165,51 +1267,7 @@ pub fn main() !void {
             }
         }.lessThan);
 
-        if (config.table) {
-            const num_output_cols = if (col_indices) |ci| ci.len else header.len;
-
-            const widths = try prog_alloc.alloc(usize, num_output_cols);
-            if (col_indices) |ci| {
-                for (ci, 0..) |c, i| {
-                    widths[i] = if (c < header.len) displayWidth(header[c]) else 0;
-                }
-            } else {
-                for (header, 0..) |h, i| {
-                    widths[i] = displayWidth(h);
-                }
-            }
-
-            for (top_rows.items) |row| {
-                if (col_indices) |ci| {
-                    for (ci, 0..) |c, j| {
-                        if (c < row.fields.len) {
-                            const dw = displayWidth(row.fields[c]);
-                            if (dw > widths[j]) widths[j] = dw;
-                        }
-                    }
-                } else {
-                    for (row.fields, 0..) |val, j| {
-                        if (j < widths.len) {
-                            const dw = displayWidth(val);
-                            if (dw > widths[j]) widths[j] = dw;
-                        }
-                    }
-                }
-            }
-
-            if (!config.no_header) {
-                try writeTableRow(writer, header, col_indices, widths);
-                try writeTableSeparator(writer, widths);
-            }
-
-            for (top_rows.items) |row| {
-                try writeTableRow(writer, row.fields, col_indices, widths);
-            }
-        } else {
-            for (top_rows.items) |row| {
-                try writeRecord(writer, row.fields, col_indices);
-            }
-        }
+        try writeTopRows(prog_alloc, writer, header, col_indices, top_rows.items, config.table, config.no_header);
 
         try bw.flush();
         return;
