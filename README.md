@@ -36,8 +36,8 @@ All input is read from stdin and output is written to stdout.
 |---|---|
 | `-s, --select FIELDS` | Comma-separated column names or 1-based indices |
 | `-f, --filter EXPR` | Filter expression (repeatable; multiple filters are ANDed) |
-| `-n, --head N` | Output first N data rows (after filtering) |
-| `--top FIELD` | Output top rows by FIELD (descending). Use with `-n` to set count (default 10) |
+| `-n, --head [N]` | Output first N data rows (after filtering). If N is omitted, defaults to 10 |
+| `--top FIELD` | Output top rows by FIELD (descending). Use with `-n` to set count (defaults to 10 when omitted) |
 | `-t, --table` | Pretty-print output as an aligned table |
 | `--no-header` | Suppress header row in output |
 | `-h, --help` | Print help message |
@@ -78,6 +78,12 @@ Top N by a column (descending):
 
 ```sh
 zsv --top salary -n 20 -s name,salary < employees.csv
+```
+
+Top 10 by default when `-n` is present without a value:
+
+```sh
+zsv --top salary -n -s name,salary < employees.csv
 ```
 
 Spaces around the operator are allowed:
@@ -164,7 +170,6 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 - Empty lines in the input are silently skipped.
 - Filter values cannot contain the operator characters (`=`, `<`, `>`, `!`, `~`) since the parser splits on the first operator it finds in the expression.
 - In transform modes (`--select`, `--filter`, or `--table`), malformed quoted fields (e.g. unterminated quotes or non-delimiter content after a closing quote) produce an error.
-- `--top` is not currently supported with `--table`.
 
 ## Error handling
 

@@ -4,6 +4,7 @@ const max_line_len: usize = 1024 * 1024;
 const max_fields: usize = 4096;
 const read_buf_size: usize = 256 * 1024;
 const table_sample_budget: usize = 1024 * 1024;
+const default_head_rows: usize = 10;
 
 const FilterOp = enum {
     eq,
@@ -58,7 +59,7 @@ fn printUsage(writer: anytype) !void {
         \\  -f, --filter EXPR     Filter expression: field op value
         \\                        Operators: =, !=, <, >, <=, >=, ~ (glob)
         \\                        Repeatable (multiple filters = AND)
-        \\  -n, --head N          Output first N data rows (after filtering)
+        \\  -n, --head [N]        Output first N data rows (after filtering; default 10 when omitted)
         \\      --top FIELD       Output top rows by FIELD (desc); use -n for count
         \\  -t, --table           Pretty-print as aligned table
         \\      --no-header       Suppress header row in output
@@ -67,12 +68,7 @@ fn printUsage(writer: anytype) !void {
     );
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !?Config {
-    var args_iter = try std.process.argsWithAllocator(allocator);
-    defer args_iter.deinit();
-
-    _ = args_iter.next();
-
+fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Config {
     var selectors = std.ArrayList([]const u8).init(allocator);
     var filters = std.ArrayList(Filter).init(allocator);
     var head: ?usize = null;
@@ -80,7 +76,9 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
     var no_header = false;
     var table = false;
 
-    while (args_iter.next()) |arg| {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             const stdout = std.io.getStdOut().writer();
             try printUsage(stdout);
@@ -90,11 +88,13 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
         } else if (std.mem.eql(u8, arg, "--no-header")) {
             no_header = true;
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--select")) {
-            const value = args_iter.next() orelse {
+            if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --select requires an argument\n");
                 return null;
-            };
+            }
+            i += 1;
+            const value = args[i];
             var it = std.mem.splitScalar(u8, value, ',');
             while (it.next()) |field| {
                 if (field.len > 0) {
@@ -102,11 +102,13 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
                 }
             }
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--filter")) {
-            const value = args_iter.next() orelse {
+            if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --filter requires an argument\n");
                 return null;
-            };
+            }
+            i += 1;
+            const value = args[i];
             const filter = parseFilter(value) orelse {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("Error: invalid filter expression: {s}\n", .{value});
@@ -114,22 +116,29 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
             };
             try filters.append(filter);
         } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--head")) {
-            const value = args_iter.next() orelse {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.writeAll("Error: --head requires an argument\n");
-                return null;
-            };
-            head = std.fmt.parseInt(usize, value, 10) catch {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print("Error: invalid --head value: {s}\n", .{value});
-                return null;
-            };
+            if (i + 1 >= args.len) {
+                head = default_head_rows;
+            } else {
+                const value = args[i + 1];
+                head = std.fmt.parseInt(usize, value, 10) catch {
+                    if (value.len > 0 and value[0] == '-') {
+                        head = default_head_rows;
+                        continue;
+                    }
+                    const stderr = std.io.getStdErr().writer();
+                    try stderr.print("Error: invalid --head value: {s}\n", .{value});
+                    return null;
+                };
+                i += 1;
+            }
         } else if (std.mem.eql(u8, arg, "--top")) {
-            const value = args_iter.next() orelse {
+            if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --top requires an argument\n");
                 return null;
-            };
+            }
+            i += 1;
+            const value = args[i];
             top_field = value;
         } else {
             const stderr = std.io.getStdErr().writer();
@@ -147,6 +156,13 @@ fn parseArgs(allocator: std.mem.Allocator) !?Config {
         .no_header = no_header,
         .table = table,
     };
+}
+
+fn parseArgs(allocator: std.mem.Allocator) !?Config {
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+    if (args.len == 0) return null;
+    return parseArgsList(args, allocator);
 }
 
 fn parseFilter(expr: []const u8) ?Filter {
@@ -720,6 +736,48 @@ test "parseFilter: returns null when operator is at start" {
     try std.testing.expect(parseFilter(">10") == null);
 }
 
+test "parseArgsList: --head defaults to 10 when value omitted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "-n" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    try std.testing.expectEqual(@as(?usize, default_head_rows), cfg.head);
+}
+
+test "parseArgsList: --head uses explicit value when provided" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--head", "25" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    try std.testing.expectEqual(@as(?usize, 25), cfg.head);
+}
+
+test "parseArgsList: --head defaults to 10 when followed by flag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "-n", "-t" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    try std.testing.expectEqual(@as(?usize, default_head_rows), cfg.head);
+    try std.testing.expect(cfg.table);
+}
+
+test "parseArgsList: --table can be combined with --top" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--table", "--top", "salary" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    try std.testing.expect(cfg.table);
+    try std.testing.expectEqualStrings("salary", cfg.top_field.?);
+}
+
 test "globMatch: exact match" {
     try std.testing.expect(globMatch("hello", "hello"));
     try std.testing.expect(!globMatch("hello", "world"));
@@ -984,11 +1042,6 @@ pub fn main() !void {
     const prog_alloc = prog_arena.allocator();
 
     const config = try parseArgs(prog_alloc) orelse return;
-    if (config.table and config.top_field != null) {
-        const stderr = std.io.getStdErr().writer();
-        try stderr.writeAll("Error: --top is not supported with --table\n");
-        std.process.exit(1);
-    }
 
     const stdin = std.io.getStdIn();
     var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
@@ -1059,7 +1112,7 @@ pub fn main() !void {
     const top_col_index: ?usize = if (config.top_field) |name| try resolveColumnIndex(header, name) else null;
 
     if (top_col_index) |top_idx| {
-        const limit = config.head orelse 10;
+        const limit = config.head orelse default_head_rows;
         if (!config.no_header) {
             try writeRecord(writer, header, col_indices);
         }
@@ -1112,8 +1165,50 @@ pub fn main() !void {
             }
         }.lessThan);
 
-        for (top_rows.items) |row| {
-            try writeRecord(writer, row.fields, col_indices);
+        if (config.table) {
+            const num_output_cols = if (col_indices) |ci| ci.len else header.len;
+
+            const widths = try prog_alloc.alloc(usize, num_output_cols);
+            if (col_indices) |ci| {
+                for (ci, 0..) |c, i| {
+                    widths[i] = if (c < header.len) displayWidth(header[c]) else 0;
+                }
+            } else {
+                for (header, 0..) |h, i| {
+                    widths[i] = displayWidth(h);
+                }
+            }
+
+            for (top_rows.items) |row| {
+                if (col_indices) |ci| {
+                    for (ci, 0..) |c, j| {
+                        if (c < row.fields.len) {
+                            const dw = displayWidth(row.fields[c]);
+                            if (dw > widths[j]) widths[j] = dw;
+                        }
+                    }
+                } else {
+                    for (row.fields, 0..) |val, j| {
+                        if (j < widths.len) {
+                            const dw = displayWidth(val);
+                            if (dw > widths[j]) widths[j] = dw;
+                        }
+                    }
+                }
+            }
+
+            if (!config.no_header) {
+                try writeTableRow(writer, header, col_indices, widths);
+                try writeTableSeparator(writer, widths);
+            }
+
+            for (top_rows.items) |row| {
+                try writeTableRow(writer, row.fields, col_indices, widths);
+            }
+        } else {
+            for (top_rows.items) |row| {
+                try writeRecord(writer, row.fields, col_indices);
+            }
         }
 
         try bw.flush();
