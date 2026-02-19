@@ -11,7 +11,7 @@
 - Single-file implementation: `src/main.zig` contains all logic and tests.
 - Zero-allocation hot path: CSV parsing uses stack-allocated buffers and returns slices into the line buffer. No heap allocation per row.
 - Buffered I/O: stdin is wrapped in a 256 KB buffered reader to minimize syscalls.
-- Constants at top of file: `max_line_len` (1 MB), `max_fields` (4096), `read_buf_size` (256 KB), `table_sample_budget` (1 MB).
+- Constants at top of file: `max_line_len` (1 MB), `max_fields` (4096), `read_buf_size` (256 KB), `table_sample_budget` (1 MB), `max_top_rows` (10,000).
 - Unit tests live in the same file (idiomatic Zig). Run with `zig build test`.
 
 ## Build
@@ -23,3 +23,4 @@
 - `parseRecord` is zero-allocation: fast path returns slices into the line buffer for unquoted/simple-quoted fields; slow path copies into a caller-provided quote buffer only for fields with escaped quotes (`""`).
 - `displayWidth` counts UTF-8 codepoints (not bytes) for table column alignment.
 - Filter parsing trims whitespace around operators so expressions like `"Total Amount > 100"` work naturally with spaced column names.
+- `--top` uses a bounded selection buffer capped at `max_top_rows` (10,000) to prevent unbounded memory growth from large `-n` values. The cap is enforced at argument parse time. `-n` without `--top` is uncapped since it streams without buffering.

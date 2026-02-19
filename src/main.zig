@@ -5,6 +5,7 @@ const max_fields: usize = 4096;
 const read_buf_size: usize = 256 * 1024;
 const table_sample_budget: usize = 1024 * 1024;
 const default_head_rows: usize = 10;
+const max_top_rows: usize = 10_000;
 
 const FilterOp = enum {
     eq,
@@ -60,7 +61,7 @@ fn printUsage(writer: anytype) !void {
         \\                        Operators: =, !=, <, >, <=, >=, ~ (glob)
         \\                        Repeatable (multiple filters = AND)
         \\  -n, --head [N]        Output first N data rows (after filtering; default 10 when omitted)
-        \\      --top FIELD       Output top rows by FIELD (desc); use -n for count
+        \\      --top FIELD       Output top rows by FIELD (desc); use -n for count (max 10000)
         \\  -t, --table           Pretty-print as aligned table
         \\      --no-header       Suppress header row in output
         \\  -h, --help            Print this help message
@@ -147,6 +148,15 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             const stderr = std.io.getStdErr().writer();
             try stderr.print("Error: unknown argument: {s}\n", .{arg});
             try printUsage(stderr);
+            return null;
+        }
+    }
+
+    if (top_field != null) {
+        const limit = head orelse default_head_rows;
+        if (limit > max_top_rows) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Error: --top -n {d} exceeds maximum of {d}\n", .{ limit, max_top_rows });
             return null;
         }
     }
@@ -840,6 +850,35 @@ test "parseArgsList: --table can be combined with --top" {
     const cfg = (try parseArgsList(&argv, allocator)).?;
     try std.testing.expect(cfg.table);
     try std.testing.expectEqualStrings("salary", cfg.top_field.?);
+}
+
+test "parseArgsList: --top rejects -n exceeding max_top_rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--top", "salary", "-n", "10001" };
+    try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
+}
+
+test "parseArgsList: --top accepts -n at max_top_rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--top", "salary", "-n", "10000" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    try std.testing.expectEqual(@as(?usize, 10000), cfg.head);
+}
+
+test "parseArgsList: -n without --top has no cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "-n", "999999" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    try std.testing.expectEqual(@as(?usize, 999999), cfg.head);
 }
 
 test "globMatch: exact match" {
