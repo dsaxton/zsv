@@ -52,6 +52,7 @@ All input is read from stdin and output is written to stdout.
 | `-f, --filter EXPR` | Filter expression (repeatable; multiple filters are ANDed) |
 | `-n, --head [N]` | Output first N data rows (after filtering). If N is omitted, defaults to 10 |
 | `--top FIELD` | Output top rows by FIELD (descending). Use with `-n` to set count (defaults to 10 when omitted) |
+| `--agg FUNC:FIELD` | Aggregate FIELD; FUNC: sum, min, max, count, mean. Repeatable; incompatible with `--top` and `--head` |
 | `-t, --table` | Pretty-print output as an aligned table |
 | `--no-header` | Suppress header row in output |
 | `-h, --help` | Print help message |
@@ -98,6 +99,12 @@ Top 10 by default when `-n` is present without a value:
 
 ```sh
 zsv --top salary -n -s name,salary < employees.csv
+```
+
+Aggregate columns (sum, min, max, count, mean):
+
+```sh
+zsv --agg sum:amount --agg count:id < data.csv
 ```
 
 Spaces around the operator are allowed:
@@ -196,5 +203,4 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 - Custom field delimiter (`-d '\t'` for TSV, `-d '|'` for pipe-delimited, etc.).
 - Case-insensitive filtering.
 - Sorting by one or more columns.
-- Count matching rows (`--count`).
 - Support newlines within quoted fields (multi-line records).
