@@ -7,6 +7,18 @@ const table_sample_budget: usize = 1024 * 1024;
 const default_head_rows: usize = 10;
 const max_top_rows: usize = 10_000;
 
+const AggFunc = enum { sum, min, max, count, mean };
+
+const Agg = struct {
+    func: AggFunc,
+    field: []const u8,
+    col_index: ?usize = null,
+    total: f64 = 0,
+    extreme: f64 = 0,
+    n: usize = 0,
+    tainted: bool = false,
+};
+
 const FilterOp = enum {
     eq,
     neq,
@@ -29,6 +41,7 @@ const Filter = struct {
 const Config = struct {
     selectors: ?[]const []const u8 = null,
     filters: ?[]Filter = null,
+    aggs: ?[]Agg = null,
     head: ?usize = null,
     top_field: ?[]const u8 = null,
     no_header: bool = false,
@@ -62,6 +75,8 @@ fn printUsage(writer: anytype) !void {
         \\                        Repeatable (multiple filters = AND)
         \\  -n, --head [N]        Output first N data rows (after filtering; default 10 when omitted)
         \\      --top FIELD       Output top rows by FIELD (desc); use -n for count (max 10000)
+        \\      --agg FUNC:FIELD  Aggregate FIELD; FUNC: sum, min, max, count, mean
+        \\                        Repeatable; incompatible with --top and --head
         \\  -t, --table           Pretty-print as aligned table
         \\      --no-header       Suppress header row in output
         \\  -h, --help            Print this help message
@@ -72,6 +87,7 @@ fn printUsage(writer: anytype) !void {
 fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Config {
     var selectors = std.ArrayList([]const u8).init(allocator);
     var filters = std.ArrayList(Filter).init(allocator);
+    var aggs = std.ArrayList(Agg).init(allocator);
     var head: ?usize = null;
     var top_field: ?[]const u8 = null;
     var no_header = false;
@@ -135,6 +151,22 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
                 };
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "--agg")) {
+            if (i + 1 >= args.len) {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.writeAll("Error: --agg requires an argument\n");
+                return null;
+            }
+            i += 1;
+            const value = args[i];
+            const parsed_agg = parseAgg(value) orelse {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error: invalid --agg expression: {s}\n", .{value});
+                return null;
+            };
+            var agg = parsed_agg;
+            agg.field = try allocator.dupe(u8, parsed_agg.field);
+            try aggs.append(agg);
         } else if (std.mem.eql(u8, arg, "--top")) {
             if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
@@ -161,9 +193,23 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
         }
     }
 
+    if (aggs.items.len > 0) {
+        if (top_field != null) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("Error: --agg cannot be combined with --top\n");
+            return null;
+        }
+        if (head != null) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("Error: --agg cannot be combined with --head\n");
+            return null;
+        }
+    }
+
     return Config{
         .selectors = if (selectors.items.len > 0) selectors.items else null,
         .filters = if (filters.items.len > 0) filters.items else null,
+        .aggs = if (aggs.items.len > 0) aggs.items else null,
         .head = head,
         .top_field = top_field,
         .no_header = no_header,
@@ -205,6 +251,15 @@ fn parseFilter(expr: []const u8) ?Filter {
         }
     }
     return null;
+}
+
+fn parseAgg(expr: []const u8) ?Agg {
+    const colon = std.mem.indexOfScalar(u8, expr, ':') orelse return null;
+    if (colon == 0 or colon + 1 >= expr.len) return null;
+    const func_str = expr[0..colon];
+    const field = expr[colon + 1 ..];
+    const func: AggFunc = if (std.mem.eql(u8, func_str, "sum")) .sum else if (std.mem.eql(u8, func_str, "min")) .min else if (std.mem.eql(u8, func_str, "max")) .max else if (std.mem.eql(u8, func_str, "count")) .count else if (std.mem.eql(u8, func_str, "mean")) .mean else return null;
+    return Agg{ .func = func, .field = field };
 }
 
 /// Parses a CSV line into fields. Returns slices into `line` for unquoted fields
@@ -641,6 +696,47 @@ fn writeTopRows(
     for (top_rows) |row| {
         try writeRecord(writer, row.fields, col_indices);
     }
+}
+
+fn updateAgg(agg: *Agg, field_val: []const u8) void {
+    switch (agg.func) {
+        .count => {
+            if (field_val.len > 0) agg.n += 1;
+        },
+        .sum, .mean => {
+            const v = std.fmt.parseFloat(f64, field_val) catch {
+                agg.tainted = true;
+                return;
+            };
+            agg.total += v;
+            agg.n += 1;
+        },
+        .min => {
+            const v = std.fmt.parseFloat(f64, field_val) catch {
+                agg.tainted = true;
+                return;
+            };
+            if (agg.n == 0 or v < agg.extreme) agg.extreme = v;
+            agg.n += 1;
+        },
+        .max => {
+            const v = std.fmt.parseFloat(f64, field_val) catch {
+                agg.tainted = true;
+                return;
+            };
+            if (agg.n == 0 or v > agg.extreme) agg.extreme = v;
+            agg.n += 1;
+        },
+    }
+}
+
+fn aggResult(agg: *const Agg) f64 {
+    return switch (agg.func) {
+        .sum => agg.total,
+        .mean => if (agg.n > 0) agg.total / @as(f64, @floatFromInt(agg.n)) else 0,
+        .min, .max => agg.extreme,
+        .count => @as(f64, @floatFromInt(agg.n)),
+    };
 }
 
 fn passesFilters(filters: ?[]Filter, fields: []const []const u8) bool {
@@ -1176,6 +1272,135 @@ test "parseRecord: too many fields returns error" {
     try std.testing.expectError(error.TooManyFields, parseRecord(line_buf[0..pos], &out, &quoted, &qbuf));
 }
 
+test "parseAgg: valid expressions" {
+    const s = parseAgg("sum:salary").?;
+    try std.testing.expectEqual(AggFunc.sum, s.func);
+    try std.testing.expectEqualStrings("salary", s.field);
+
+    const mn = parseAgg("min:age").?;
+    try std.testing.expectEqual(AggFunc.min, mn.func);
+    try std.testing.expectEqualStrings("age", mn.field);
+
+    const mx = parseAgg("max:Total Amount").?;
+    try std.testing.expectEqual(AggFunc.max, mx.func);
+    try std.testing.expectEqualStrings("Total Amount", mx.field);
+
+    const c = parseAgg("count:name").?;
+    try std.testing.expectEqual(AggFunc.count, c.func);
+    try std.testing.expectEqualStrings("name", c.field);
+
+    const me = parseAgg("mean:score").?;
+    try std.testing.expectEqual(AggFunc.mean, me.func);
+    try std.testing.expectEqualStrings("score", me.field);
+}
+
+test "parseAgg: field with colon uses everything after first colon" {
+    const a = parseAgg("sum:Rate:2024").?;
+    try std.testing.expectEqual(AggFunc.sum, a.func);
+    try std.testing.expectEqualStrings("Rate:2024", a.field);
+}
+
+test "parseAgg: invalid expressions" {
+    try std.testing.expect(parseAgg("avg:salary") == null); // unknown func
+    try std.testing.expect(parseAgg("sum:") == null); // empty field
+    try std.testing.expect(parseAgg("sum") == null); // no colon
+    try std.testing.expect(parseAgg(":salary") == null); // empty func
+    try std.testing.expect(parseAgg("") == null);
+}
+
+test "updateAgg: sum accumulates" {
+    var agg = Agg{ .func = .sum, .field = "x" };
+    updateAgg(&agg, "10");
+    updateAgg(&agg, "20.5");
+    try std.testing.expectEqual(@as(usize, 2), agg.n);
+    try std.testing.expectApproxEqAbs(@as(f64, 30.5), agg.total, 1e-9);
+    try std.testing.expect(!agg.tainted);
+}
+
+test "updateAgg: non-numeric value sets tainted" {
+    var agg = Agg{ .func = .sum, .field = "x" };
+    updateAgg(&agg, "10");
+    updateAgg(&agg, "not_a_number");
+    try std.testing.expect(agg.tainted);
+    try std.testing.expectEqual(@as(usize, 1), agg.n);
+}
+
+test "updateAgg: min tracks minimum" {
+    var agg = Agg{ .func = .min, .field = "x" };
+    updateAgg(&agg, "5");
+    updateAgg(&agg, "2");
+    updateAgg(&agg, "8");
+    try std.testing.expectApproxEqAbs(@as(f64, 2), agg.extreme, 1e-9);
+}
+
+test "updateAgg: max tracks maximum" {
+    var agg = Agg{ .func = .max, .field = "x" };
+    updateAgg(&agg, "5");
+    updateAgg(&agg, "2");
+    updateAgg(&agg, "8");
+    try std.testing.expectApproxEqAbs(@as(f64, 8), agg.extreme, 1e-9);
+}
+
+test "updateAgg: count increments for non-empty values" {
+    var agg = Agg{ .func = .count, .field = "x" };
+    updateAgg(&agg, "hello");
+    updateAgg(&agg, ""); // skipped
+    updateAgg(&agg, "world");
+    try std.testing.expectEqual(@as(usize, 2), agg.n);
+}
+
+test "updateAgg: mean accumulates total and count" {
+    var agg = Agg{ .func = .mean, .field = "x" };
+    updateAgg(&agg, "10");
+    updateAgg(&agg, "20");
+    updateAgg(&agg, "30");
+    try std.testing.expectApproxEqAbs(@as(f64, 60), agg.total, 1e-9);
+    try std.testing.expectEqual(@as(usize, 3), agg.n);
+}
+
+test "aggResult: mean divides total by n" {
+    const agg = Agg{ .func = .mean, .field = "x", .total = 60, .n = 3 };
+    try std.testing.expectApproxEqAbs(@as(f64, 20), aggResult(&agg), 1e-9);
+}
+
+test "aggResult: mean with zero rows returns 0" {
+    const agg = Agg{ .func = .mean, .field = "x" };
+    try std.testing.expectApproxEqAbs(@as(f64, 0), aggResult(&agg), 1e-9);
+}
+
+test "parseArgsList: --agg parses correctly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--agg", "sum:salary", "--agg", "min:age" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    const aggs = cfg.aggs.?;
+    try std.testing.expectEqual(@as(usize, 2), aggs.len);
+    try std.testing.expectEqual(AggFunc.sum, aggs[0].func);
+    try std.testing.expectEqualStrings("salary", aggs[0].field);
+    try std.testing.expectEqual(AggFunc.min, aggs[1].func);
+    try std.testing.expectEqualStrings("age", aggs[1].field);
+}
+
+test "parseArgsList: --agg combined with --top errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--agg", "sum:salary", "--top", "salary" };
+    try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
+}
+
+test "parseArgsList: --agg combined with --head errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--agg", "sum:salary", "--head", "5" };
+    try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1208,7 +1433,7 @@ pub fn main() !void {
     } orelse return;
     var rows_written: usize = 0;
 
-    if (!config.table and config.selectors == null and config.filters == null and config.top_field == null) {
+    if (!config.table and config.selectors == null and config.filters == null and config.top_field == null and config.aggs == null) {
         if (!config.no_header) {
             try writer.writeAll(header_line);
             try writer.writeByte('\n');
@@ -1307,6 +1532,60 @@ pub fn main() !void {
         }.lessThan);
 
         try writeTopRows(prog_alloc, writer, header, col_indices, top_rows.items, config.table, config.no_header);
+
+        try bw.flush();
+        return;
+    }
+
+    if (config.aggs) |aggs| {
+        for (aggs) |*agg| {
+            agg.col_index = try resolveColumnIndex(header, agg.field);
+        }
+
+        while (true) {
+            const line = readNextLine(&reader, &line_buf) catch break orelse break;
+            line_no += 1;
+            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
+                std.process.exit(1);
+            };
+            if (!passesFilters(config.filters, result.fields)) continue;
+            for (aggs) |*agg| {
+                const col = agg.col_index orelse continue;
+                if (col < result.fields.len) updateAgg(agg, result.fields[col]);
+            }
+        }
+
+        const agg_headers = try prog_alloc.alloc([]const u8, aggs.len);
+        const agg_values = try prog_alloc.alloc([]const u8, aggs.len);
+        const stderr = std.io.getStdErr().writer();
+        for (aggs, 0..) |*agg, i| {
+            agg_headers[i] = try std.fmt.allocPrint(prog_alloc, "{s}({s})", .{ @tagName(agg.func), agg.field });
+            if (agg.func == .count) {
+                agg_values[i] = try std.fmt.allocPrint(prog_alloc, "{d}", .{agg.n});
+            } else if (agg.tainted) {
+                try stderr.print("Warning: {s}({s}): non-numeric values encountered\n", .{ @tagName(agg.func), agg.field });
+                agg_values[i] = "";
+            } else {
+                agg_values[i] = try std.fmt.allocPrint(prog_alloc, "{d}", .{aggResult(agg)});
+            }
+        }
+
+        if (config.table) {
+            const widths = try prog_alloc.alloc(usize, aggs.len);
+            for (aggs, 0..) |_, i| {
+                widths[i] = @max(displayWidth(agg_headers[i]), displayWidth(agg_values[i]));
+            }
+            if (!config.no_header) {
+                try writeTableRow(writer, agg_headers, null, widths);
+                try writeTableSeparator(writer, widths);
+            }
+            try writeTableRow(writer, agg_values, null, widths);
+        } else {
+            if (!config.no_header) try writeRecord(writer, agg_headers, null);
+            try writeRecord(writer, agg_values, null);
+        }
 
         try bw.flush();
         return;
