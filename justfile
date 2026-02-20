@@ -1,5 +1,11 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+build:
+    zig build -Doptimize=ReleaseFast
+
+build-debug:
+    zig build
+
 test:
     zig build test
 
