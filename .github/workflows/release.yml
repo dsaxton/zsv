@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 jobs:
-  build-release:
+  build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -30,9 +30,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: master
+        run: |
+          mkdir -p /opt/zig
+          cd /opt/zig
+          ZIG_VERSION="0.14.1"
+          ZIG_DIR="zig-x86_64-linux-${ZIG_VERSION}"
+          wget -q -O zig.tar.xz https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz 2>/dev/null || curl -L -o zig.tar.xz https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz
+          tar -xf zig.tar.xz
+          echo "/opt/zig/${ZIG_DIR}" >> $GITHUB_PATH
 
       - name: Build for ${{ matrix.target }}
         run: |
@@ -43,33 +48,42 @@ jobs:
       - name: Strip binary (non-Windows)
         if: matrix.target != 'x86_64-windows-gnu'
         run: |
-          if command -v llvm-strip &> /dev/null; then
-            llvm-strip zig-out/bin/${{ matrix.artifact_name }}
-          else
-            strip zig-out/bin/${{ matrix.artifact_name }} || true
-          fi
+          strip zig-out/bin/${{ matrix.artifact_name }} || true
 
-      - name: Upload Release Asset
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Rename binary
         run: |
-          gh release upload ${{ github.ref_name }} \
-            zig-out/bin/${{ matrix.artifact_name }} \
-            --repo ${{ github.repository }} \
-            --clobber
+          cp zig-out/bin/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
 
-  create-release:
-    needs: build-release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          retention-days: 1
+
+  release:
+    needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: binaries
+
+      - name: Prepare files
+        run: |
+          mkdir -p release_assets
+          find binaries -type f -exec mv {} release_assets/ \;
+          ls -la release_assets/
+
       - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release_assets/*
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create ${{ github.ref_name }} \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            --repo ${{ github.repository }} || true
