@@ -44,6 +44,7 @@ const Config = struct {
     aggs: ?[]Agg = null,
     head: ?usize = null,
     top_field: ?[]const u8 = null,
+    sample: ?usize = null,
     no_header: bool = false,
     table: bool = false,
 };
@@ -75,6 +76,7 @@ fn printUsage(writer: anytype) !void {
         \\                        Repeatable (multiple filters = AND)
         \\  -n, --head [N]        Output first N data rows (after filtering; default 10 when omitted)
         \\      --top FIELD       Output top rows by FIELD (desc); use -n for count (max 10000)
+        \\      --sample N        Output uniform random sample of N rows (after filtering)
         \\      --agg FUNC:FIELD  Aggregate FIELD; FUNC: sum, min, max, count, mean
         \\                        Repeatable; incompatible with --top and --head
         \\  -t, --table           Pretty-print as aligned table
@@ -90,6 +92,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
     var aggs = std.ArrayList(Agg).init(allocator);
     var head: ?usize = null;
     var top_field: ?[]const u8 = null;
+    var sample: ?usize = null;
     var no_header = false;
     var table = false;
 
@@ -176,6 +179,24 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             i += 1;
             const value = args[i];
             top_field = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, arg, "--sample")) {
+            if (i + 1 >= args.len) {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.writeAll("Error: --sample requires an argument\n");
+                return null;
+            }
+            i += 1;
+            const n = std.fmt.parseInt(usize, args[i], 10) catch {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error: invalid --sample value: {s}\n", .{args[i]});
+                return null;
+            };
+            if (n == 0) {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.writeAll("Error: --sample must be >= 1\n");
+                return null;
+            }
+            sample = n;
         } else {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("Error: unknown argument: {s}\n", .{arg});
@@ -206,12 +227,31 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
         }
     }
 
+    if (sample) |_| {
+        if (top_field != null) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("Error: --sample cannot be combined with --top\n");
+            return null;
+        }
+        if (aggs.items.len > 0) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("Error: --sample cannot be combined with --agg\n");
+            return null;
+        }
+        if (head != null) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("Error: --sample cannot be combined with --head\n");
+            return null;
+        }
+    }
+
     return Config{
         .selectors = if (selectors.items.len > 0) selectors.items else null,
         .filters = if (filters.items.len > 0) filters.items else null,
         .aggs = if (aggs.items.len > 0) aggs.items else null,
         .head = head,
         .top_field = top_field,
+        .sample = sample,
         .no_header = no_header,
         .table = table,
     };
@@ -535,6 +575,10 @@ const TopRow = struct {
     key_num: ?f64,
 };
 
+const SampleRow = struct {
+    fields: []const []const u8,
+};
+
 fn compareTopKeys(a_num: ?f64, a: []const u8, b_num: ?f64, b: []const u8) std.math.Order {
     if (a_num != null and b_num != null) {
         return std.math.order(a_num.?, b_num.?);
@@ -694,6 +738,67 @@ fn writeTopRows(
         try writeRecord(writer, header, col_indices);
     }
     for (top_rows) |row| {
+        try writeRecord(writer, row.fields, col_indices);
+    }
+}
+
+fn writeSampleRows(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    header: []const []const u8,
+    col_indices: ?[]const usize,
+    rows: []const SampleRow,
+    table: bool,
+    no_header: bool,
+) !void {
+    if (table) {
+        const num_output_cols = if (col_indices) |ci| ci.len else header.len;
+        const widths = try allocator.alloc(usize, num_output_cols);
+        defer allocator.free(widths);
+
+        if (col_indices) |ci| {
+            for (ci, 0..) |c, i| {
+                widths[i] = if (c < header.len) displayWidth(header[c]) else 0;
+            }
+        } else {
+            for (header, 0..) |h, i| {
+                widths[i] = displayWidth(h);
+            }
+        }
+
+        for (rows) |row| {
+            if (col_indices) |ci| {
+                for (ci, 0..) |c, j| {
+                    if (c < row.fields.len) {
+                        const dw = displayWidth(row.fields[c]);
+                        if (dw > widths[j]) widths[j] = dw;
+                    }
+                }
+            } else {
+                for (row.fields, 0..) |val, j| {
+                    if (j < widths.len) {
+                        const dw = displayWidth(val);
+                        if (dw > widths[j]) widths[j] = dw;
+                    }
+                }
+            }
+        }
+
+        if (!no_header) {
+            try writeTableRow(writer, header, col_indices, widths);
+            try writeTableSeparator(writer, widths);
+        }
+
+        for (rows) |row| {
+            try writeTableRow(writer, row.fields, col_indices, widths);
+        }
+        return;
+    }
+
+    if (!no_header) {
+        try writeRecord(writer, header, col_indices);
+    }
+    for (rows) |row| {
         try writeRecord(writer, row.fields, col_indices);
     }
 }
@@ -1401,6 +1506,55 @@ test "parseArgsList: --agg combined with --head errors" {
     try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
 }
 
+test "parseArgsList: --sample parses N" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--sample", "50" };
+    const cfg = (try parseArgsList(&argv, allocator)) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqual(cfg.sample, 50);
+}
+
+test "parseArgsList: --sample + --top errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--sample", "50", "--top", "salary" };
+    try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
+}
+
+test "parseArgsList: --sample + --agg errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--sample", "50", "--agg", "sum:salary" };
+    try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
+}
+
+test "parseArgsList: --sample + --head errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--sample", "50", "--head", "5" };
+    try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
+}
+
+test "parseArgsList: --sample 0 errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--sample", "0" };
+    try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1433,7 +1587,7 @@ pub fn main() !void {
     } orelse return;
     var rows_written: usize = 0;
 
-    if (!config.table and config.selectors == null and config.filters == null and config.top_field == null and config.aggs == null) {
+    if (!config.table and config.selectors == null and config.filters == null and config.top_field == null and config.aggs == null and config.sample == null) {
         if (!config.no_header) {
             try writer.writeAll(header_line);
             try writer.writeByte('\n');
@@ -1587,6 +1741,47 @@ pub fn main() !void {
             try writeRecord(writer, agg_values, null);
         }
 
+        try bw.flush();
+        return;
+    }
+
+    if (config.sample) |sample_n| {
+        var reservoir = std.ArrayList(SampleRow).init(allocator);
+        defer {
+            for (reservoir.items) |row| {
+                freeClonedFields(allocator, row.fields);
+            }
+            reservoir.deinit();
+        }
+
+        var rows_seen: usize = 0;
+        while (true) {
+            const line = readNextLine(&reader, &line_buf) catch break orelse break;
+            line_no += 1;
+            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
+                std.process.exit(1);
+            };
+            if (!passesFilters(config.filters, result.fields)) continue;
+
+            if (reservoir.items.len < sample_n) {
+                // Fill phase
+                const duped = try cloneFields(allocator, result.fields);
+                try reservoir.append(.{ .fields = duped });
+            } else {
+                // Replace phase: j uniform in [0, rows_seen]
+                const j = std.crypto.random.intRangeLessThan(usize, 0, rows_seen + 1);
+                if (j < sample_n) {
+                    const duped = try cloneFields(allocator, result.fields);
+                    freeClonedFields(allocator, reservoir.items[j].fields);
+                    reservoir.items[j] = .{ .fields = duped };
+                }
+            }
+            rows_seen += 1;
+        }
+
+        try writeSampleRows(prog_alloc, writer, header, col_indices, reservoir.items, config.table, config.no_header);
         try bw.flush();
         return;
     }
