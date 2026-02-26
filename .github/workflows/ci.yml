@@ -16,11 +16,12 @@ jobs:
         run: |
           set -x
           cd /tmp
-          curl -L https://github.com/ziglang/zig/releases/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o zig.tar.xz
+          # Get download URL from GitHub API
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/ziglang/zig/releases/tags/0.13.0 | grep -o '"browser_download_url":"[^"]*linux-x86_64-0.13.0.tar.xz[^"]*' | cut -d'"' -f4)
+          echo "Downloading from: $DOWNLOAD_URL"
+          curl -L "$DOWNLOAD_URL" -o zig.tar.xz
           tar -xf zig.tar.xz
           echo "/tmp/zig-linux-x86_64-0.13.0" >> $GITHUB_PATH
-          which zig || true
-          zig version || true
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast
@@ -45,11 +46,12 @@ jobs:
         run: |
           set -x
           cd /tmp
-          curl -L https://github.com/ziglang/zig/releases/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o zig.tar.xz
+          # Get download URL from GitHub API
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/ziglang/zig/releases/tags/0.13.0 | grep -o '"browser_download_url":"[^"]*linux-x86_64-0.13.0.tar.xz[^"]*' | cut -d'"' -f4)
+          echo "Downloading from: $DOWNLOAD_URL"
+          curl -L "$DOWNLOAD_URL" -o zig.tar.xz
           tar -xf zig.tar.xz
           echo "/tmp/zig-linux-x86_64-0.13.0" >> $GITHUB_PATH
-          which zig || true
-          zig version || true
 
       - name: Build for ${{ matrix.target }}
         run: |
