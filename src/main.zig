@@ -258,10 +258,18 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !?Config {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-    if (args.len == 0) return null;
-    return parseArgsList(args, allocator);
+    var args = std.ArrayList([]const u8).init(allocator);
+    defer args.deinit();
+
+    var arg_iter = try std.process.argsWithAllocator(allocator);
+    defer arg_iter.deinit();
+
+    while (arg_iter.next()) |arg| {
+        try args.append(arg);
+    }
+
+    if (args.items.len == 0) return null;
+    return parseArgsList(args.items, allocator);
 }
 
 fn parseFilter(expr: []const u8) ?Filter {
