@@ -14,9 +14,6 @@ jobs:
           - target: x86_64-linux-gnu
             artifact_name: zsv
             asset_name: zsv-linux-x86_64
-          - target: aarch64-linux-gnu
-            artifact_name: zsv
-            asset_name: zsv-linux-aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -24,14 +21,8 @@ jobs:
         run: |
           mkdir -p /opt/zig
           cd /opt/zig
-          # Determine which Zig binary to download based on the target
-          if [[ "${{ matrix.target }}" == "aarch64-linux-gnu" ]]; then
-            ZIG_ARCH="aarch64"
-          else
-            ZIG_ARCH="x86_64"
-          fi
           ZIG_VERSION="0.14.1"
-          ZIG_DIR="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}"
+          ZIG_DIR="zig-x86_64-linux-${ZIG_VERSION}"
           wget -q -O zig.tar.xz https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz 2>/dev/null || curl -L -o zig.tar.xz https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz
           tar -xf zig.tar.xz
           echo "/opt/zig/${ZIG_DIR}" >> $GITHUB_PATH
