@@ -22,10 +22,11 @@ jobs:
 
       - name: Install Zig
         run: |
-          cd /tmp
-          curl -sL "https://github.com/ziglang/zig/releases/expanded_assets/0.13.0" | grep -o 'href="[^"]*linux-x86_64[^"]*\.tar\.xz"' | head -1 | cut -d'"' -f2 | xargs -I {} curl -L "https://github.com{}" -o zig.tar.xz
+          mkdir -p /opt/zig
+          cd /opt/zig
+          wget -q -O zig.tar.xz https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz 2>/dev/null || curl -L -o zig.tar.xz https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
           tar -xf zig.tar.xz
-          echo "/tmp/zig-linux-x86_64-0.13.0" >> $GITHUB_PATH
+          echo "/opt/zig/zig-linux-x86_64-0.13.0" >> $GITHUB_PATH
 
       - name: Build for ${{ matrix.target }}
         run: |
