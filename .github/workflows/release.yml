@@ -20,12 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download and install Zig
-        run: |
-          ZIG_VERSION="0.14.0-dev"
-          wget -q https://ziglang.org/builds/zig-linux-x86_64-${ZIG_VERSION}.tar.xz
-          tar -xf zig-linux-x86_64-${ZIG_VERSION}.tar.xz
-          echo "$(pwd)/zig-linux-x86_64-${ZIG_VERSION}" >> $GITHUB_PATH
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
 
       - name: Build for ${{ matrix.target }}
         run: |
