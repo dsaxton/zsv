@@ -14,6 +14,18 @@ jobs:
           - target: x86_64-linux-gnu
             artifact_name: zsv
             asset_name: zsv-linux-x86_64
+          - target: aarch64-linux-gnu
+            artifact_name: zsv
+            asset_name: zsv-linux-aarch64
+          - target: x86_64-macos
+            artifact_name: zsv
+            asset_name: zsv-macos-x86_64
+          - target: aarch64-macos
+            artifact_name: zsv
+            asset_name: zsv-macos-aarch64
+          - target: x86_64-windows-gnu
+            artifact_name: zsv.exe
+            asset_name: zsv-windows-x86_64.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +45,8 @@ jobs:
             -Doptimize=ReleaseFast \
             -Dtarget=${{ matrix.target }}
 
-      - name: Strip binary
+      - name: Strip binary (non-Windows)
+        if: matrix.target != 'x86_64-windows-gnu'
         run: |
           strip zig-out/bin/${{ matrix.artifact_name }} || true
 
