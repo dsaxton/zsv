@@ -3,3 +3,4 @@ zig-out/
 main
 main.o
 .cursor/
+.claude/
