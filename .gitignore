@@ -1,2 +1,6 @@
 zig-out/
 .zig-cache/
+main
+main.o
+.cursor/
+.claude/
