@@ -466,36 +466,17 @@ fn evaluateFilter(filter: *const Filter, fields: []const []const u8) bool {
         return globMatch(filter_val, field_val);
     }
 
-    if (filter.value_num_parsed and filter.value_num != null) {
-        const b = filter.value_num.?;
-        const field_num = std.fmt.parseFloat(f64, field_val) catch null;
-        if (field_num) |a| {
-            return switch (filter.op) {
-                .eq => a == b,
-                .neq => a != b,
-                .lt => a < b,
-                .gt => a > b,
-                .lte => a <= b,
-                .gte => a >= b,
-                .like => unreachable,
-            };
-        }
-    } else if (!filter.value_num_parsed) {
-        const field_num = std.fmt.parseFloat(f64, field_val) catch null;
-        const filter_num = std.fmt.parseFloat(f64, filter_val) catch null;
-        if (field_num != null and filter_num != null) {
-            const a = field_num.?;
-            const b = filter_num.?;
-            return switch (filter.op) {
-                .eq => a == b,
-                .neq => a != b,
-                .lt => a < b,
-                .gt => a > b,
-                .lte => a <= b,
-                .gte => a >= b,
-                .like => unreachable,
-            };
-        }
+    if (filter.value_num) |b| {
+        const field_num = std.fmt.parseFloat(f64, field_val) catch return false;
+        return switch (filter.op) {
+            .eq => field_num == b,
+            .neq => field_num != b,
+            .lt => field_num < b,
+            .gt => field_num > b,
+            .lte => field_num <= b,
+            .gte => field_num >= b,
+            .like => unreachable,
+        };
     }
 
     const order = std.mem.order(u8, field_val, filter_val);
@@ -612,6 +593,7 @@ fn freeClonedFields(allocator: std.mem.Allocator, fields: []const []const u8) vo
 }
 
 fn worstTopIndex(rows: []const TopRow) usize {
+    std.debug.assert(rows.len > 0);
     var worst: usize = 0;
     var i: usize = 1;
     while (i < rows.len) : (i += 1) {
@@ -854,8 +836,9 @@ fn passesFilters(filters: ?[]Filter, fields: []const []const u8) bool {
 
 fn readNextLine(reader: anytype, buf: []u8) !?[]const u8 {
     while (true) {
-        const line = reader.readUntilDelimiterOrEof(buf, '\n') catch {
-            return error.LineTooLong;
+        const line = reader.readUntilDelimiterOrEof(buf, '\n') catch |err| {
+            if (err == error.StreamTooLong) return error.LineTooLong;
+            return err;
         } orelse return null;
 
         const clean = if (line.len > 0 and line[line.len - 1] == '\r')
@@ -1555,6 +1538,125 @@ test "parseArgsList: --sample 0 errors" {
     try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
 }
 
+test "header with escaped quotes is not corrupted by subsequent data rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var field_buf: [max_fields][]const u8 = undefined;
+    var quoted_buf: [max_fields]bool = undefined;
+    var quote_buf: [max_line_len]u8 = undefined;
+
+    const header_line = "\"col\"\"name\",value";
+    const header_result = try parseRecord(header_line, &field_buf, &quoted_buf, &quote_buf);
+
+    const header_shallow = try alloc.dupe([]const u8, header_result.fields);
+    try std.testing.expectEqualStrings("col\"name", header_shallow[0]);
+
+    const data_line = "\"data\"\"1\",world";
+    _ = try parseRecord(data_line, &field_buf, &quoted_buf, &quote_buf);
+
+    const header_deep = try alloc.alloc([]const u8, header_result.fields.len);
+    const header_result2 = try parseRecord(header_line, &field_buf, &quoted_buf, &quote_buf);
+    for (header_result2.fields, 0..) |field, i| {
+        header_deep[i] = try alloc.dupe(u8, field);
+    }
+
+    const data_line2 = "\"overwrite\"\"me\",x";
+    _ = try parseRecord(data_line2, &field_buf, &quoted_buf, &quote_buf);
+
+    try std.testing.expectEqualStrings("col\"name", header_deep[0]);
+    try std.testing.expectEqualStrings("value", header_deep[1]);
+}
+
+test "evaluateFilter: numeric filter does not match non-numeric field values" {
+    const f = parseFilter("price>100").?;
+    var filter = Filter{
+        .field = f.field,
+        .op = f.op,
+        .value = f.value,
+        .col_index = 0,
+        .value_num_parsed = f.value_num_parsed,
+        .value_num = f.value_num,
+    };
+
+    const fields_na = [_][]const u8{"N/A"};
+    try std.testing.expect(!evaluateFilter(&filter, &fields_na));
+
+    const fields_abc = [_][]const u8{"abc"};
+    try std.testing.expect(!evaluateFilter(&filter, &fields_abc));
+
+    const fields_200 = [_][]const u8{"200"};
+    try std.testing.expect(evaluateFilter(&filter, &fields_200));
+
+    const fields_50 = [_][]const u8{"50"};
+    try std.testing.expect(!evaluateFilter(&filter, &fields_50));
+}
+
+test "evaluateFilter: numeric equality filter does not match non-numeric field" {
+    const f = parseFilter("x=42").?;
+    const filter = Filter{
+        .field = f.field,
+        .op = f.op,
+        .value = f.value,
+        .col_index = 0,
+        .value_num_parsed = f.value_num_parsed,
+        .value_num = f.value_num,
+    };
+
+    const fields_text = [_][]const u8{"N/A"};
+    try std.testing.expect(!evaluateFilter(&filter, &fields_text));
+
+    const fields_num = [_][]const u8{"42"};
+    try std.testing.expect(evaluateFilter(&filter, &fields_num));
+}
+
+test "parseFilter always sets value_num_parsed = true" {
+    const f_num = parseFilter("score>50").?;
+    try std.testing.expect(f_num.value_num_parsed);
+    try std.testing.expect(f_num.value_num != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 50), f_num.value_num.?, 1e-9);
+
+    const f_text = parseFilter("name=Alice").?;
+    try std.testing.expect(f_text.value_num_parsed);
+    try std.testing.expect(f_text.value_num == null);
+}
+
+test "readNextLine: StreamTooLong is reported as LineTooLong" {
+    var buf: [4]u8 = undefined;
+    var stream = std.io.fixedBufferStream("hello\n");
+    var reader = stream.reader();
+    try std.testing.expectError(error.LineTooLong, readNextLine(&reader, &buf));
+}
+
+test "readNextLine: skips empty lines without exposing count" {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream("\n\n\ndata\n");
+    var reader = stream.reader();
+    const line = (try readNextLine(&reader, &buf)).?;
+    try std.testing.expectEqualStrings("data", line);
+}
+
+test "worstTopIndex: single-element slice returns index 0" {
+    const f1 = [_][]const u8{"x"};
+    const rows = [_]TopRow{
+        .{ .fields = &f1, .key = "42", .key_num = 42 },
+    };
+    try std.testing.expectEqual(@as(usize, 0), worstTopIndex(&rows));
+}
+
+test "worstTopIndex: returns index of smallest key among multiple rows" {
+    const f1 = [_][]const u8{"a"};
+    const f2 = [_][]const u8{"b"};
+    const f3 = [_][]const u8{"c"};
+    const rows = [_]TopRow{
+        .{ .fields = &f1, .key = "5", .key_num = 5 },
+        .{ .fields = &f2, .key = "1", .key_num = 1 },
+        .{ .fields = &f3, .key = "9", .key_num = 9 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), worstTopIndex(&rows));
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1574,7 +1676,6 @@ pub fn main() !void {
     var bw = std.io.bufferedWriter(stdout.writer());
     const writer = bw.writer();
 
-    // Stack-allocated line buffer and field/quote scratch space.
     var line_buf: [max_line_len]u8 = undefined;
     var field_buf: [max_fields][]const u8 = undefined;
     var quoted_buf: [max_fields]bool = undefined;
@@ -1614,7 +1715,10 @@ pub fn main() !void {
         try stderr.print("Error parsing CSV header: {s}\n", .{parseRecordErrorMessage(err)});
         std.process.exit(1);
     };
-    const header = try prog_alloc.dupe([]const u8, header_result.fields);
+    const header = try prog_alloc.alloc([]const u8, header_result.fields.len);
+    for (header_result.fields, 0..) |field, i| {
+        header[i] = try prog_alloc.dupe(u8, field);
+    }
     var line_no: usize = 1;
 
     var col_indices: ?[]usize = null;
