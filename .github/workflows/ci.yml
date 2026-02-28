@@ -16,9 +16,9 @@ jobs:
         run: |
           mkdir -p /opt/zig
           cd /opt/zig
-          wget -q -O zig.tar.xz https://ziglang.org/download/0.14.1/zig-linux-x86_64-0.14.1.tar.xz 2>/dev/null || curl -L -o zig.tar.xz https://ziglang.org/download/0.14.1/zig-linux-x86_64-0.14.1.tar.xz
+          curl -L -o zig.tar.xz https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz
           tar -xf zig.tar.xz
-          echo "/opt/zig/zig-linux-x86_64-0.14.1" >> $GITHUB_PATH
+          echo "/opt/zig/zig-x86_64-linux-0.14.1" >> $GITHUB_PATH
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast
@@ -43,9 +43,9 @@ jobs:
         run: |
           mkdir -p /opt/zig
           cd /opt/zig
-          wget -q -O zig.tar.xz https://ziglang.org/download/0.14.1/zig-linux-x86_64-0.14.1.tar.xz 2>/dev/null || curl -L -o zig.tar.xz https://ziglang.org/download/0.14.1/zig-linux-x86_64-0.14.1.tar.xz
+          curl -L -o zig.tar.xz https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz
           tar -xf zig.tar.xz
-          echo "/opt/zig/zig-linux-x86_64-0.14.1" >> $GITHUB_PATH
+          echo "/opt/zig/zig-x86_64-linux-0.14.1" >> $GITHUB_PATH
 
       - name: Build for ${{ matrix.target }}
         run: |
