@@ -47,6 +47,7 @@ const Config = struct {
     sample: ?usize = null,
     no_header: bool = false,
     table: bool = false,
+    validate: bool = false,
 };
 
 const ParseRecordError = error{
@@ -81,6 +82,7 @@ fn printUsage(writer: anytype) !void {
         \\                        Repeatable; incompatible with --top and --head
         \\  -t, --table           Pretty-print as aligned table
         \\      --no-header       Suppress header row in output
+        \\      --validate        Validate CSV structure (parse + column count)
         \\  -h, --help            Print this help message
         \\
     );
@@ -95,6 +97,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
     var sample: ?usize = null;
     var no_header = false;
     var table = false;
+    var validate = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -197,6 +200,8 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
                 return null;
             }
             sample = n;
+        } else if (std.mem.eql(u8, arg, "--validate")) {
+            validate = true;
         } else {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("Error: unknown argument: {s}\n", .{arg});
@@ -245,6 +250,14 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
         }
     }
 
+    if (validate) {
+        if (selectors.items.len > 0 or filters.items.len > 0 or aggs.items.len > 0 or head != null or top_field != null or sample != null or table) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("Error: --validate cannot be combined with other output options\n");
+            return null;
+        }
+    }
+
     return Config{
         .selectors = if (selectors.items.len > 0) selectors.items else null,
         .filters = if (filters.items.len > 0) filters.items else null,
@@ -254,6 +267,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
         .sample = sample,
         .no_header = no_header,
         .table = table,
+        .validate = validate,
     };
 }
 
@@ -1538,6 +1552,25 @@ test "parseArgsList: --sample 0 errors" {
     try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
 }
 
+test "parseArgsList: --validate sets flag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--validate" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    try std.testing.expect(cfg.validate);
+}
+
+test "parseArgsList: --validate rejects --top" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--validate", "--top", "salary" };
+    try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
+}
+
 test "header with escaped quotes is not corrupted by subsequent data rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1687,6 +1720,47 @@ pub fn main() !void {
         return;
     } orelse return;
     var rows_written: usize = 0;
+
+    if (config.validate) {
+        const header_result = parseRecord(header_line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Error parsing CSV header: {s}\n", .{parseRecordErrorMessage(err)});
+            std.process.exit(1);
+        };
+        const expected_cols = header_result.fields.len;
+        var line_no: usize = 1;
+        var rows_seen: usize = 0;
+
+        while (true) {
+            const line = readNextLine(&reader, &line_buf) catch |err| {
+                const stderr = std.io.getStdErr().writer();
+                if (err == error.LineTooLong) {
+                    try stderr.print("Error reading line {d}: line too long\n", .{line_no + 1});
+                    std.process.exit(1);
+                }
+                return err;
+            } orelse break;
+            line_no += 1;
+            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
+                std.process.exit(1);
+            };
+            if (result.fields.len != expected_cols) {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print(
+                    "Error: column count mismatch on line {d}: expected {d}, got {d}\n",
+                    .{ line_no, expected_cols, result.fields.len },
+                );
+                std.process.exit(1);
+            }
+            rows_seen += 1;
+        }
+
+        try writer.print("Valid: {d} row(s)\n", .{rows_seen});
+        try bw.flush();
+        return;
+    }
 
     if (!config.table and config.selectors == null and config.filters == null and config.top_field == null and config.aggs == null and config.sample == null) {
         if (!config.no_header) {
