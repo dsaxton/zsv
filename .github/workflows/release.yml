@@ -65,13 +65,13 @@ jobs:
 
       - name: Install Zig
         run: |
-          mkdir -p /opt/zig
-          cd /opt/zig
+          mkdir -p $HOME/zig
+          cd $HOME/zig
           ZIG_VERSION="0.14.1"
           ZIG_DIR="zig-macos-aarch64-${ZIG_VERSION}"
           wget -q -O zig.tar.xz https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz 2>/dev/null || curl -L -o zig.tar.xz https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz
           tar -xf zig.tar.xz
-          echo "/opt/zig/${ZIG_DIR}" >> $GITHUB_PATH
+          echo "$HOME/${ZIG_DIR}" >> $GITHUB_PATH
 
       - name: Build for aarch64-macos
         run: |
