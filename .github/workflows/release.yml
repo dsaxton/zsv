@@ -20,9 +20,6 @@ jobs:
           - target: x86_64-macos
             artifact_name: zsv
             asset_name: zsv-macos-x86_64
-          - target: aarch64-macos
-            artifact_name: zsv
-            asset_name: zsv-macos-aarch64
           - target: x86_64-windows-gnu
             artifact_name: zsv.exe
             asset_name: zsv-windows-x86_64.exe
@@ -61,8 +58,44 @@ jobs:
           path: ${{ matrix.asset_name }}
           retention-days: 1
 
+  build-macos-arm:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          mkdir -p /opt/zig
+          cd /opt/zig
+          ZIG_VERSION="0.14.1"
+          ZIG_DIR="zig-macos-aarch64-${ZIG_VERSION}"
+          wget -q -O zig.tar.xz https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz 2>/dev/null || curl -L -o zig.tar.xz https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz
+          tar -xf zig.tar.xz
+          echo "/opt/zig/${ZIG_DIR}" >> $GITHUB_PATH
+
+      - name: Build for aarch64-macos
+        run: |
+          zig build \
+            -Doptimize=ReleaseFast \
+            -Dtarget=aarch64-macos
+
+      - name: Strip binary
+        run: |
+          strip zig-out/bin/zsv || true
+
+      - name: Rename binary
+        run: |
+          cp zig-out/bin/zsv zsv-macos-aarch64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zsv-macos-aarch64
+          path: zsv-macos-aarch64
+          retention-days: 1
+
   release:
-    needs: build
+    needs: [build, build-macos-arm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
