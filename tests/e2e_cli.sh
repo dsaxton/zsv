@@ -74,6 +74,47 @@ run_case \
   $'name  | score\n------+------\nAlice | 9    \nBob   | 8    \nCara  | 10   \nDan   | 7    \n' \
   -t -s name,score
 
+TSV_INPUT=$'name\tscore\tdept\nAlice\t9\tEng\nBob\t8\tSales\nCara\t10\tEng\nDan\t7\tOps\n'
+actual="$(printf '%s' "$TSV_INPUT" | "$exe" -d tab -s name,score -f 'dept=Eng')"
+expected=$'name\tscore\nAlice\t9\nCara\t10'
+if [[ "$actual" == "$expected" ]]; then
+  echo "[PASS] delimiter: tab select and filter"
+else
+  echo "[FAIL] delimiter: tab select and filter"
+  echo "  expected:"
+  printf '%s\n' "$expected" | sed 's/^/    /'
+  echo "  actual:"
+  printf '%s\n' "$actual" | sed 's/^/    /'
+  failures=$((failures + 1))
+fi
+
+HEADERLESS_INPUT=$'Alice,9,Eng\nBob,8,Sales\nCara,10,Eng\nDan,7,Ops\n'
+actual="$(printf '%s' "$HEADERLESS_INPUT" | "$exe" --input-no-header -s 1,3 -f '2>8')"
+expected=$'Alice,Eng\nCara,Eng'
+if [[ "$actual" == "$expected" ]]; then
+  echo "[PASS] input-no-header: first row is data"
+else
+  echo "[FAIL] input-no-header: first row is data"
+  echo "  expected:"
+  printf '%s\n' "$expected" | sed 's/^/    /'
+  echo "  actual:"
+  printf '%s\n' "$actual" | sed 's/^/    /'
+  failures=$((failures + 1))
+fi
+
+actual="$(printf '%s' "$CSV_INPUT" | "$exe" --group-by dept --agg count:name --agg mean:score)"
+expected=$'dept,count(name),mean(score)\nEng,2,9.5\nSales,1,8\nOps,1,7'
+if [[ "$actual" == "$expected" ]]; then
+  echo "[PASS] group-by: aggregates by first-seen group order"
+else
+  echo "[FAIL] group-by: aggregates by first-seen group order"
+  echo "  expected:"
+  printf '%s\n' "$expected" | sed 's/^/    /'
+  echo "  actual:"
+  printf '%s\n' "$actual" | sed 's/^/    /'
+  failures=$((failures + 1))
+fi
+
 # Test --sample: produces exactly 3 lines (1 header + 2 data rows)
 actual="$(printf '%s' "$CSV_INPUT" | "$exe" --sample 2)"
 line_count="$(echo "$actual" | grep -c "")"

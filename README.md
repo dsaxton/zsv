@@ -49,12 +49,17 @@ All input is read from stdin and output is written to stdout.
 | Flag | Description |
 |---|---|
 | `-s, --select FIELDS` | Comma-separated column names or 1-based indices |
+| `--group-by FIELDS` | Group aggregations by comma-separated column names or 1-based indices |
 | `-f, --filter EXPR` | Filter expression (repeatable; multiple filters are ANDed) |
+| `-d, --delimiter DELIM` | Field delimiter. Defaults to comma; use `tab` or `\t` for TSV |
 | `-n, --head [N]` | Output first N data rows (after filtering). If N is omitted, defaults to 10 |
 | `--top FIELD` | Output top rows by FIELD (descending). Use with `-n` to set count (defaults to 10 when omitted) |
+| `--sample N` | Output a uniform random sample of N rows after filtering |
 | `--agg FUNC:FIELD` | Aggregate FIELD; FUNC: sum, min, max, count, mean. Repeatable; incompatible with `--top` and `--head` |
 | `-t, --table` | Pretty-print output as an aligned table |
 | `--no-header` | Suppress header row in output |
+| `--input-no-header` | Treat the first input row as data instead of a header |
+| `--validate` | Validate CSV structure and column counts |
 | `-h, --help` | Print help message |
 
 ### Examples
@@ -75,6 +80,18 @@ Select by 1-based index:
 
 ```sh
 zsv -s 1,3 < data.csv
+```
+
+Process TSV input:
+
+```sh
+zsv -d tab -s name,score < data.tsv
+```
+
+Process headerless input using 1-based column references:
+
+```sh
+zsv --input-no-header -s 1,3 -f "2>100" < data.csv
 ```
 
 Filter rows:
@@ -105,6 +122,12 @@ Aggregate columns (sum, min, max, count, mean):
 
 ```sh
 zsv --agg sum:amount --agg count:id < data.csv
+```
+
+Group aggregations:
+
+```sh
+zsv --group-by department --agg count:id --agg mean:salary < employees.csv
 ```
 
 Spaces around the operator are allowed:
@@ -184,7 +207,6 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 ## Limitations
 
 - Input must be read from stdin (no filename argument).
-- The first row is always treated as a header. There is no headerless-input mode.
 - Maximum line length is 1 MB. Lines exceeding this limit produce an error.
 - Maximum fields per row is 4096. Rows exceeding this limit produce an error.
 - Newlines within quoted fields are not supported (the parser splits on `\n` before parsing fields).

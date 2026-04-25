@@ -6,6 +6,7 @@ const read_buf_size: usize = 256 * 1024;
 const table_sample_budget: usize = 1024 * 1024;
 const default_head_rows: usize = 10;
 const max_top_rows: usize = 10_000;
+const default_delimiter: u8 = ',';
 
 const AggFunc = enum { sum, min, max, count, mean };
 
@@ -40,12 +41,15 @@ const Filter = struct {
 
 const Config = struct {
     selectors: ?[]const []const u8 = null,
+    group_by: ?[]const []const u8 = null,
     filters: ?[]Filter = null,
     aggs: ?[]Agg = null,
     head: ?usize = null,
     top_field: ?[]const u8 = null,
     sample: ?usize = null,
+    delimiter: u8 = default_delimiter,
     no_header: bool = false,
+    input_no_header: bool = false,
     table: bool = false,
     validate: bool = false,
 };
@@ -72,9 +76,11 @@ fn printUsage(writer: anytype) !void {
         \\
         \\Options:
         \\  -s, --select FIELDS   Comma-separated column names or 1-based indices
+        \\      --group-by FIELDS Group aggregations by comma-separated columns
         \\  -f, --filter EXPR     Filter expression: field op value
         \\                        Operators: =, !=, <, >, <=, >=, ~ (glob)
         \\                        Repeatable (multiple filters = AND)
+        \\  -d, --delimiter DELIM Field delimiter (default comma; supports tab or \t)
         \\  -n, --head [N]        Output first N data rows (after filtering; default 10 when omitted)
         \\      --top FIELD       Output top rows by FIELD (desc); use -n for count (max 10000)
         \\      --sample N        Output uniform random sample of N rows (after filtering)
@@ -82,20 +88,30 @@ fn printUsage(writer: anytype) !void {
         \\                        Repeatable; incompatible with --top and --head
         \\  -t, --table           Pretty-print as aligned table
         \\      --no-header       Suppress header row in output
+        \\      --input-no-header Treat the first input row as data
         \\      --validate        Validate CSV structure (parse + column count)
         \\  -h, --help            Print this help message
         \\
     );
 }
 
+fn parseDelimiter(value: []const u8) ?u8 {
+    if (std.mem.eql(u8, value, "tab") or std.mem.eql(u8, value, "\\t")) return '\t';
+    if (value.len == 1) return value[0];
+    return null;
+}
+
 fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Config {
     var selectors = std.ArrayList([]const u8).init(allocator);
+    var group_by = std.ArrayList([]const u8).init(allocator);
     var filters = std.ArrayList(Filter).init(allocator);
     var aggs = std.ArrayList(Agg).init(allocator);
     var head: ?usize = null;
     var top_field: ?[]const u8 = null;
     var sample: ?usize = null;
+    var delimiter: u8 = default_delimiter;
     var no_header = false;
+    var input_no_header = false;
     var table = false;
     var validate = false;
 
@@ -110,6 +126,20 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             table = true;
         } else if (std.mem.eql(u8, arg, "--no-header")) {
             no_header = true;
+        } else if (std.mem.eql(u8, arg, "--input-no-header")) {
+            input_no_header = true;
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--delimiter")) {
+            if (i + 1 >= args.len) {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.writeAll("Error: --delimiter requires an argument\n");
+                return null;
+            }
+            i += 1;
+            delimiter = parseDelimiter(args[i]) orelse {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error: invalid --delimiter value: {s}\n", .{args[i]});
+                return null;
+            };
         } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--select")) {
             if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
@@ -122,6 +152,20 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             while (it.next()) |field| {
                 if (field.len > 0) {
                     try selectors.append(try allocator.dupe(u8, field));
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--group-by")) {
+            if (i + 1 >= args.len) {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.writeAll("Error: --group-by requires an argument\n");
+                return null;
+            }
+            i += 1;
+            const value = args[i];
+            var it = std.mem.splitScalar(u8, value, ',');
+            while (it.next()) |field| {
+                if (field.len > 0) {
+                    try group_by.append(try allocator.dupe(u8, field));
                 }
             }
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--filter")) {
@@ -230,6 +274,28 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             try stderr.writeAll("Error: --agg cannot be combined with --head\n");
             return null;
         }
+    } else if (group_by.items.len > 0) {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.writeAll("Error: --group-by requires --agg\n");
+        return null;
+    }
+
+    if (group_by.items.len > 0) {
+        if (selectors.items.len > 0) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("Error: --group-by cannot be combined with --select\n");
+            return null;
+        }
+        if (top_field != null) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("Error: --group-by cannot be combined with --top\n");
+            return null;
+        }
+        if (head != null) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.writeAll("Error: --group-by cannot be combined with --head\n");
+            return null;
+        }
     }
 
     if (sample) |_| {
@@ -251,7 +317,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
     }
 
     if (validate) {
-        if (selectors.items.len > 0 or filters.items.len > 0 or aggs.items.len > 0 or head != null or top_field != null or sample != null or table) {
+        if (selectors.items.len > 0 or group_by.items.len > 0 or filters.items.len > 0 or aggs.items.len > 0 or head != null or top_field != null or sample != null or table) {
             const stderr = std.io.getStdErr().writer();
             try stderr.writeAll("Error: --validate cannot be combined with other output options\n");
             return null;
@@ -260,12 +326,15 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
 
     return Config{
         .selectors = if (selectors.items.len > 0) selectors.items else null,
+        .group_by = if (group_by.items.len > 0) group_by.items else null,
         .filters = if (filters.items.len > 0) filters.items else null,
         .aggs = if (aggs.items.len > 0) aggs.items else null,
         .head = head,
         .top_field = top_field,
         .sample = sample,
+        .delimiter = delimiter,
         .no_header = no_header,
+        .input_no_header = input_no_header,
         .table = table,
         .validate = validate,
     };
@@ -318,14 +387,14 @@ fn parseAgg(expr: []const u8) ?Agg {
 
 /// Parses a CSV line into fields. Returns slices into `line` for unquoted fields
 /// and slices into `quote_buf` for quoted fields containing escaped quotes.
-fn parseRecord(line: []const u8, out: [][]const u8, quoted: []bool, quote_buf: []u8) ParseRecordError!struct { fields: [][]const u8, quoted: []const bool, quote_buf_used: usize } {
+fn parseRecord(line: []const u8, delimiter: u8, out: [][]const u8, quoted: []bool, quote_buf: []u8) ParseRecordError!struct { fields: [][]const u8, quoted: []const bool, quote_buf_used: usize } {
     var n: usize = 0;
     var qb_used: usize = 0;
     var i: usize = 0;
 
     while (i <= line.len) {
         if (i == line.len) {
-            if (line.len > 0 and line[line.len - 1] == ',') {
+            if (line.len > 0 and line[line.len - 1] == delimiter) {
                 if (n >= out.len) return error.TooManyFields;
                 out[n] = "";
                 quoted[n] = false;
@@ -363,7 +432,7 @@ fn parseRecord(line: []const u8, out: [][]const u8, quoted: []bool, quote_buf: [
                 i = scan + 1; // skip closing quote
                 if (i == line.len) {
                     break;
-                } else if (line[i] == ',') {
+                } else if (line[i] == delimiter) {
                     i += 1;
                 } else {
                     return error.MalformedQuotedField;
@@ -399,7 +468,7 @@ fn parseRecord(line: []const u8, out: [][]const u8, quoted: []bool, quote_buf: [
                 n += 1;
                 if (i == line.len) {
                     break;
-                } else if (line[i] == ',') {
+                } else if (line[i] == delimiter) {
                     i += 1;
                 } else {
                     return error.MalformedQuotedField;
@@ -407,7 +476,7 @@ fn parseRecord(line: []const u8, out: [][]const u8, quoted: []bool, quote_buf: [
             }
         } else {
             const start = i;
-            while (i < line.len and line[i] != ',') : (i += 1) {}
+            while (i < line.len and line[i] != delimiter) : (i += 1) {}
             out[n] = line[start..i];
             quoted[n] = false;
             n += 1;
@@ -505,8 +574,8 @@ fn evaluateFilter(filter: *const Filter, fields: []const []const u8) bool {
     };
 }
 
-fn writeField(writer: anytype, field: []const u8) !void {
-    const needs_quoting = std.mem.indexOfAny(u8, field, ",\"\n\r") != null;
+fn writeField(writer: anytype, field: []const u8, delimiter: u8) !void {
+    const needs_quoting = std.mem.indexOfAny(u8, field, "\"\n\r") != null or std.mem.indexOfScalar(u8, field, delimiter) != null;
     if (needs_quoting) {
         try writer.writeByte('"');
         for (field) |c| {
@@ -522,30 +591,30 @@ fn writeField(writer: anytype, field: []const u8) !void {
     }
 }
 
-fn writeRecord(writer: anytype, fields: []const []const u8, col_indices: ?[]const usize) !void {
+fn writeRecord(writer: anytype, fields: []const []const u8, col_indices: ?[]const usize, delimiter: u8) !void {
     if (col_indices) |indices| {
         for (indices, 0..) |ci, i| {
-            if (i > 0) try writer.writeByte(',');
+            if (i > 0) try writer.writeByte(delimiter);
             if (ci < fields.len) {
-                try writeField(writer, fields[ci]);
+                try writeField(writer, fields[ci], delimiter);
             }
         }
     } else {
         for (fields, 0..) |field, i| {
-            if (i > 0) try writer.writeByte(',');
-            try writeField(writer, field);
+            if (i > 0) try writer.writeByte(delimiter);
+            try writeField(writer, field, delimiter);
         }
     }
     try writer.writeByte('\n');
 }
 
-fn writeRecordWithQuotedMask(writer: anytype, fields: []const []const u8, quoted: []const bool, col_indices: ?[]const usize) !void {
+fn writeRecordWithQuotedMask(writer: anytype, fields: []const []const u8, quoted: []const bool, col_indices: ?[]const usize, delimiter: u8) !void {
     if (col_indices) |indices| {
         for (indices, 0..) |ci, i| {
-            if (i > 0) try writer.writeByte(',');
+            if (i > 0) try writer.writeByte(delimiter);
             if (ci < fields.len) {
                 if (quoted[ci]) {
-                    try writeField(writer, fields[ci]);
+                    try writeField(writer, fields[ci], delimiter);
                 } else {
                     try writer.writeAll(fields[ci]);
                 }
@@ -553,9 +622,9 @@ fn writeRecordWithQuotedMask(writer: anytype, fields: []const []const u8, quoted
         }
     } else {
         for (fields, 0..) |field, i| {
-            if (i > 0) try writer.writeByte(',');
+            if (i > 0) try writer.writeByte(delimiter);
             if (quoted[i]) {
-                try writeField(writer, field);
+                try writeField(writer, field, delimiter);
             } else {
                 try writer.writeAll(field);
             }
@@ -572,6 +641,11 @@ const TopRow = struct {
 
 const SampleRow = struct {
     fields: []const []const u8,
+};
+
+const GroupRow = struct {
+    values: []const []const u8,
+    aggs: []Agg,
 };
 
 fn compareTopKeys(a_num: ?f64, a: []const u8, b_num: ?f64, b: []const u8) std.math.Order {
@@ -604,6 +678,33 @@ fn freeClonedFields(allocator: std.mem.Allocator, fields: []const []const u8) vo
         allocator.free(field);
     }
     allocator.free(fields);
+}
+
+fn makeGroupKey(allocator: std.mem.Allocator, fields: []const []const u8, group_indices: []const usize) ![]const u8 {
+    var key = std.ArrayList(u8).init(allocator);
+    for (group_indices) |idx| {
+        const value = if (idx < fields.len) fields[idx] else "";
+        try key.writer().print("{d}:", .{value.len});
+        try key.appendSlice(value);
+        try key.append('|');
+    }
+    return try key.toOwnedSlice();
+}
+
+fn cloneGroupValues(allocator: std.mem.Allocator, fields: []const []const u8, group_indices: []const usize) ![]const []const u8 {
+    const values = try allocator.alloc([]const u8, group_indices.len);
+    for (group_indices, 0..) |idx, i| {
+        values[i] = try allocator.dupe(u8, if (idx < fields.len) fields[idx] else "");
+    }
+    return values;
+}
+
+fn cloneAggSpecs(allocator: std.mem.Allocator, aggs: []const Agg) ![]Agg {
+    const cloned = try allocator.alloc(Agg, aggs.len);
+    for (aggs, 0..) |agg, i| {
+        cloned[i] = Agg{ .func = agg.func, .field = agg.field, .col_index = agg.col_index };
+    }
+    return cloned;
 }
 
 fn worstTopIndex(rows: []const TopRow) usize {
@@ -685,6 +786,7 @@ fn writeTopRows(
     top_rows: []const TopRow,
     table: bool,
     no_header: bool,
+    delimiter: u8,
 ) !void {
     if (table) {
         const num_output_cols = if (col_indices) |ci| ci.len else header.len;
@@ -731,10 +833,10 @@ fn writeTopRows(
     }
 
     if (!no_header) {
-        try writeRecord(writer, header, col_indices);
+        try writeRecord(writer, header, col_indices, delimiter);
     }
     for (top_rows) |row| {
-        try writeRecord(writer, row.fields, col_indices);
+        try writeRecord(writer, row.fields, col_indices, delimiter);
     }
 }
 
@@ -746,6 +848,7 @@ fn writeSampleRows(
     rows: []const SampleRow,
     table: bool,
     no_header: bool,
+    delimiter: u8,
 ) !void {
     if (table) {
         const num_output_cols = if (col_indices) |ci| ci.len else header.len;
@@ -792,10 +895,10 @@ fn writeSampleRows(
     }
 
     if (!no_header) {
-        try writeRecord(writer, header, col_indices);
+        try writeRecord(writer, header, col_indices, delimiter);
     }
     for (rows) |row| {
-        try writeRecord(writer, row.fields, col_indices);
+        try writeRecord(writer, row.fields, col_indices, delimiter);
     }
 }
 
@@ -865,6 +968,25 @@ fn readNextLine(reader: anytype, buf: []u8) !?[]const u8 {
     }
 }
 
+fn readDataLine(reader: anytype, buf: []u8, pending_first_data: *?[]const u8, line_no: *usize) !?[]const u8 {
+    if (pending_first_data.*) |line| {
+        pending_first_data.* = null;
+        line_no.* += 1;
+        return line;
+    }
+    const line = try readNextLine(reader, buf) orelse return null;
+    line_no.* += 1;
+    return line;
+}
+
+fn makeSyntheticHeader(allocator: std.mem.Allocator, count: usize) ![]const []const u8 {
+    const header = try allocator.alloc([]const u8, count);
+    for (header, 0..) |*field, i| {
+        field.* = try std.fmt.allocPrint(allocator, "{d}", .{i + 1});
+    }
+    return header;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -881,7 +1003,7 @@ fn testParseRecord(line: []const u8) TestParseResult {
     result.out = undefined;
     result.qbuf = undefined;
     var quoted: [max_fields]bool = undefined;
-    const r = parseRecord(line, &result.out, &quoted, &result.qbuf) catch unreachable;
+    const r = parseRecord(line, default_delimiter, &result.out, &quoted, &result.qbuf) catch unreachable;
     result.fields = r.fields;
     result.quote_buf_used = r.quote_buf_used;
     return result;
@@ -945,6 +1067,17 @@ test "parseRecord: fields with spaces" {
     try std.testing.expectEqualStrings("Total Amount", f[0]);
     try std.testing.expectEqualStrings("First Name", f[1]);
     try std.testing.expectEqualStrings("Last Name", f[2]);
+}
+
+test "parseRecord: custom delimiter" {
+    var out: [max_fields][]const u8 = undefined;
+    var quoted: [max_fields]bool = undefined;
+    var qbuf: [4096]u8 = undefined;
+    const r = try parseRecord("alice\t\"sales, west\"\t42", '\t', &out, &quoted, &qbuf);
+    try std.testing.expectEqual(@as(usize, 3), r.fields.len);
+    try std.testing.expectEqualStrings("alice", r.fields[0]);
+    try std.testing.expectEqualStrings("sales, west", r.fields[1]);
+    try std.testing.expectEqualStrings("42", r.fields[2]);
 }
 
 test "parseFilter: simple operators" {
@@ -1048,6 +1181,38 @@ test "parseArgsList: --table can be combined with --top" {
     const cfg = (try parseArgsList(&argv, allocator)).?;
     try std.testing.expect(cfg.table);
     try std.testing.expectEqualStrings("salary", cfg.top_field.?);
+}
+
+test "parseArgsList: delimiter and input-no-header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--delimiter", "tab", "--input-no-header" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    try std.testing.expectEqual(@as(u8, '\t'), cfg.delimiter);
+    try std.testing.expect(cfg.input_no_header);
+}
+
+test "parseArgsList: group-by requires agg" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--group-by", "dept" };
+    try std.testing.expect((try parseArgsList(&argv, allocator)) == null);
+}
+
+test "parseArgsList: group-by parses with agg" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = [_][]const u8{ "zsv", "--group-by", "dept,region", "--agg", "sum:sales" };
+    const cfg = (try parseArgsList(&argv, allocator)).?;
+    try std.testing.expectEqual(@as(usize, 2), cfg.group_by.?.len);
+    try std.testing.expectEqualStrings("dept", cfg.group_by.?[0]);
+    try std.testing.expectEqualStrings("region", cfg.group_by.?[1]);
 }
 
 test "parseArgsList: --top rejects -n exceeding max_top_rows" {
@@ -1230,29 +1395,36 @@ test "displayWidth: four-byte UTF-8 (emoji)" {
 test "writeField: plain field unchanged" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try writeField(fbs.writer(), "hello");
+    try writeField(fbs.writer(), "hello", default_delimiter);
     try std.testing.expectEqualStrings("hello", fbs.getWritten());
 }
 
 test "writeField: field with comma gets quoted" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try writeField(fbs.writer(), "a,b");
+    try writeField(fbs.writer(), "a,b", default_delimiter);
     try std.testing.expectEqualStrings("\"a,b\"", fbs.getWritten());
 }
 
 test "writeField: field with quote gets escaped" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try writeField(fbs.writer(), "she said \"hi\"");
+    try writeField(fbs.writer(), "she said \"hi\"", default_delimiter);
     try std.testing.expectEqualStrings("\"she said \"\"hi\"\"\"", fbs.getWritten());
+}
+
+test "writeField: custom delimiter gets quoted" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeField(fbs.writer(), "a\tb", '\t');
+    try std.testing.expectEqualStrings("\"a\tb\"", fbs.getWritten());
 }
 
 test "writeRecord: all fields, no column selection" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const fields = [_][]const u8{ "a", "b", "c" };
-    try writeRecord(fbs.writer(), &fields, null);
+    try writeRecord(fbs.writer(), &fields, null, default_delimiter);
     try std.testing.expectEqualStrings("a,b,c\n", fbs.getWritten());
 }
 
@@ -1261,7 +1433,7 @@ test "writeRecord: with column selection" {
     var fbs = std.io.fixedBufferStream(&buf);
     const fields = [_][]const u8{ "a", "b", "c", "d" };
     const indices = [_]usize{ 2, 0 };
-    try writeRecord(fbs.writer(), &fields, &indices);
+    try writeRecord(fbs.writer(), &fields, &indices, default_delimiter);
     try std.testing.expectEqualStrings("c,a\n", fbs.getWritten());
 }
 
@@ -1276,7 +1448,7 @@ test "writeTopRows: table mode emits one header row" {
         .{ .fields = &row2_fields, .key = row2_fields[1], .key_num = 8.0 },
     };
 
-    try writeTopRows(std.testing.allocator, fbs.writer(), &header, null, &rows, true, false);
+    try writeTopRows(std.testing.allocator, fbs.writer(), &header, null, &rows, true, false, default_delimiter);
     try std.testing.expectEqualStrings(
         "name  | score\n" ++
             "------+------\n" ++
@@ -1297,7 +1469,7 @@ test "writeTopRows: csv mode emits one header row" {
         .{ .fields = &row2_fields, .key = row2_fields[1], .key_num = 8.0 },
     };
 
-    try writeTopRows(std.testing.allocator, fbs.writer(), &header, null, &rows, false, false);
+    try writeTopRows(std.testing.allocator, fbs.writer(), &header, null, &rows, false, false, default_delimiter);
     try std.testing.expectEqualStrings(
         "name,score\n" ++
             "Alice,9\n" ++
@@ -1346,14 +1518,14 @@ test "parseRecord: malformed quoted field returns error" {
     var out: [max_fields][]const u8 = undefined;
     var quoted: [max_fields]bool = undefined;
     var qbuf: [4096]u8 = undefined;
-    try std.testing.expectError(error.MalformedQuotedField, parseRecord("\"x\"oops,2,3", &out, &quoted, &qbuf));
+    try std.testing.expectError(error.MalformedQuotedField, parseRecord("\"x\"oops,2,3", default_delimiter, &out, &quoted, &qbuf));
 }
 
 test "parseRecord: unterminated quoted field returns error" {
     var out: [max_fields][]const u8 = undefined;
     var quoted: [max_fields]bool = undefined;
     var qbuf: [4096]u8 = undefined;
-    try std.testing.expectError(error.UnterminatedQuote, parseRecord("\"abc,def", &out, &quoted, &qbuf));
+    try std.testing.expectError(error.UnterminatedQuote, parseRecord("\"abc,def", default_delimiter, &out, &quoted, &qbuf));
 }
 
 test "parseRecord: too many fields returns error" {
@@ -1371,7 +1543,7 @@ test "parseRecord: too many fields returns error" {
     var out: [max_fields][]const u8 = undefined;
     var quoted: [max_fields]bool = undefined;
     var qbuf: [4096]u8 = undefined;
-    try std.testing.expectError(error.TooManyFields, parseRecord(line_buf[0..pos], &out, &quoted, &qbuf));
+    try std.testing.expectError(error.TooManyFields, parseRecord(line_buf[0..pos], default_delimiter, &out, &quoted, &qbuf));
 }
 
 test "parseAgg: valid expressions" {
@@ -1581,22 +1753,22 @@ test "header with escaped quotes is not corrupted by subsequent data rows" {
     var quote_buf: [max_line_len]u8 = undefined;
 
     const header_line = "\"col\"\"name\",value";
-    const header_result = try parseRecord(header_line, &field_buf, &quoted_buf, &quote_buf);
+    const header_result = try parseRecord(header_line, default_delimiter, &field_buf, &quoted_buf, &quote_buf);
 
     const header_shallow = try alloc.dupe([]const u8, header_result.fields);
     try std.testing.expectEqualStrings("col\"name", header_shallow[0]);
 
     const data_line = "\"data\"\"1\",world";
-    _ = try parseRecord(data_line, &field_buf, &quoted_buf, &quote_buf);
+    _ = try parseRecord(data_line, default_delimiter, &field_buf, &quoted_buf, &quote_buf);
 
     const header_deep = try alloc.alloc([]const u8, header_result.fields.len);
-    const header_result2 = try parseRecord(header_line, &field_buf, &quoted_buf, &quote_buf);
+    const header_result2 = try parseRecord(header_line, default_delimiter, &field_buf, &quoted_buf, &quote_buf);
     for (header_result2.fields, 0..) |field, i| {
         header_deep[i] = try alloc.dupe(u8, field);
     }
 
     const data_line2 = "\"overwrite\"\"me\",x";
-    _ = try parseRecord(data_line2, &field_buf, &quoted_buf, &quote_buf);
+    _ = try parseRecord(data_line2, default_delimiter, &field_buf, &quoted_buf, &quote_buf);
 
     try std.testing.expectEqualStrings("col\"name", header_deep[0]);
     try std.testing.expectEqualStrings("value", header_deep[1]);
@@ -1722,14 +1894,18 @@ pub fn main() !void {
     var rows_written: usize = 0;
 
     if (config.validate) {
-        const header_result = parseRecord(header_line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+        const header_result = parseRecord(header_line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
             const stderr = std.io.getStdErr().writer();
-            try stderr.print("Error parsing CSV header: {s}\n", .{parseRecordErrorMessage(err)});
+            if (config.input_no_header) {
+                try stderr.print("Error parsing CSV on line 1: {s}\n", .{parseRecordErrorMessage(err)});
+            } else {
+                try stderr.print("Error parsing CSV header: {s}\n", .{parseRecordErrorMessage(err)});
+            }
             std.process.exit(1);
         };
         const expected_cols = header_result.fields.len;
         var line_no: usize = 1;
-        var rows_seen: usize = 0;
+        var rows_seen: usize = if (config.input_no_header) 1 else 0;
 
         while (true) {
             const line = readNextLine(&reader, &line_buf) catch |err| {
@@ -1741,7 +1917,7 @@ pub fn main() !void {
                 return err;
             } orelse break;
             line_no += 1;
-            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
                 std.process.exit(1);
@@ -1763,9 +1939,15 @@ pub fn main() !void {
     }
 
     if (!config.table and config.selectors == null and config.filters == null and config.top_field == null and config.aggs == null and config.sample == null) {
-        if (!config.no_header) {
+        if (!config.input_no_header and !config.no_header) {
             try writer.writeAll(header_line);
             try writer.writeByte('\n');
+        } else if (config.input_no_header) {
+            if (config.head == null or config.head.? > 0) {
+                try writer.writeAll(header_line);
+                try writer.writeByte('\n');
+                rows_written += 1;
+            }
         }
 
         while (true) {
@@ -1782,18 +1964,31 @@ pub fn main() !void {
         return;
     }
 
-    // Header must be heap-duped since line_buf will be reused.
+    // Header/first-data line must be heap-duped since line_buf will be reused.
     const header_line_copy = try prog_alloc.dupe(u8, header_line);
-    const header_result = parseRecord(header_line_copy, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+    const first_result = parseRecord(header_line_copy, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
         const stderr = std.io.getStdErr().writer();
-        try stderr.print("Error parsing CSV header: {s}\n", .{parseRecordErrorMessage(err)});
+        if (config.input_no_header) {
+            try stderr.print("Error parsing CSV on line 1: {s}\n", .{parseRecordErrorMessage(err)});
+        } else {
+            try stderr.print("Error parsing CSV header: {s}\n", .{parseRecordErrorMessage(err)});
+        }
         std.process.exit(1);
     };
-    const header = try prog_alloc.alloc([]const u8, header_result.fields.len);
-    for (header_result.fields, 0..) |field, i| {
-        header[i] = try prog_alloc.dupe(u8, field);
-    }
+    const header = if (config.input_no_header) try makeSyntheticHeader(prog_alloc, first_result.fields.len) else blk: {
+        const real_header = try prog_alloc.alloc([]const u8, first_result.fields.len);
+        for (first_result.fields, 0..) |field, i| {
+            real_header[i] = try prog_alloc.dupe(u8, field);
+        }
+        break :blk real_header;
+    };
+    var pending_first_data: ?[]const u8 = null;
     var line_no: usize = 1;
+    if (config.input_no_header) {
+        pending_first_data = header_line_copy;
+        line_no = 0;
+    }
+    const emit_input_header = !config.input_no_header and !config.no_header;
 
     var col_indices: ?[]usize = null;
     if (config.selectors) |selectors| {
@@ -1828,9 +2023,8 @@ pub fn main() !void {
         }
 
         while (true) {
-            const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            line_no += 1;
-            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
+            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
                 std.process.exit(1);
@@ -1863,7 +2057,7 @@ pub fn main() !void {
             }
         }.lessThan);
 
-        try writeTopRows(prog_alloc, writer, header, col_indices, top_rows.items, config.table, config.no_header);
+        try writeTopRows(prog_alloc, writer, header, col_indices, top_rows.items, config.table, !emit_input_header, config.delimiter);
 
         try bw.flush();
         return;
@@ -1874,10 +2068,114 @@ pub fn main() !void {
             agg.col_index = try resolveColumnIndex(header, agg.field);
         }
 
+        if (config.group_by) |group_by| {
+            const group_indices = try prog_alloc.alloc(usize, group_by.len);
+            for (group_by, 0..) |field, i| {
+                group_indices[i] = try resolveColumnIndex(header, field);
+            }
+
+            var groups = std.ArrayList(GroupRow).init(prog_alloc);
+            var group_lookup = std.StringHashMap(usize).init(prog_alloc);
+            var any_tainted = try prog_alloc.alloc(bool, aggs.len);
+            @memset(any_tainted, false);
+
+            while (true) {
+                const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
+                const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                    const stderr = std.io.getStdErr().writer();
+                    try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
+                    std.process.exit(1);
+                };
+                if (!passesFilters(config.filters, result.fields)) continue;
+
+                const key = try makeGroupKey(allocator, result.fields, group_indices);
+                const group_index = if (group_lookup.get(key)) |idx| blk: {
+                    allocator.free(key);
+                    break :blk idx;
+                } else blk: {
+                    const idx = groups.items.len;
+                    const persisted_key = try prog_alloc.dupe(u8, key);
+                    allocator.free(key);
+                    try groups.append(.{
+                        .values = try cloneGroupValues(prog_alloc, result.fields, group_indices),
+                        .aggs = try cloneAggSpecs(prog_alloc, aggs),
+                    });
+                    try group_lookup.put(persisted_key, idx);
+                    break :blk idx;
+                };
+
+                for (groups.items[group_index].aggs, 0..) |*agg, i| {
+                    const col = agg.col_index orelse continue;
+                    if (col < result.fields.len) updateAgg(agg, result.fields[col]);
+                    if (agg.tainted) any_tainted[i] = true;
+                }
+            }
+
+            const output_cols = group_by.len + aggs.len;
+            const out_headers = try prog_alloc.alloc([]const u8, output_cols);
+            for (group_indices, 0..) |idx, i| {
+                out_headers[i] = header[idx];
+            }
+            for (aggs, 0..) |*agg, i| {
+                out_headers[group_by.len + i] = try std.fmt.allocPrint(prog_alloc, "{s}({s})", .{ @tagName(agg.func), agg.field });
+            }
+
+            const stderr = std.io.getStdErr().writer();
+            for (aggs, 0..) |*agg, i| {
+                if (any_tainted[i]) {
+                    try stderr.print("Warning: {s}({s}): non-numeric values encountered\n", .{ @tagName(agg.func), agg.field });
+                }
+            }
+
+            const rows = try prog_alloc.alloc([]const []const u8, groups.items.len);
+            for (groups.items, 0..) |*group, row_i| {
+                const row = try prog_alloc.alloc([]const u8, output_cols);
+                for (group.values, 0..) |value, i| {
+                    row[i] = value;
+                }
+                for (group.aggs, 0..) |*agg, i| {
+                    row[group_by.len + i] = if (agg.func == .count)
+                        try std.fmt.allocPrint(prog_alloc, "{d}", .{agg.n})
+                    else if (agg.tainted)
+                        ""
+                    else
+                        try std.fmt.allocPrint(prog_alloc, "{d}", .{aggResult(agg)});
+                }
+                rows[row_i] = row;
+            }
+
+            if (config.table) {
+                const widths = try prog_alloc.alloc(usize, output_cols);
+                for (out_headers, 0..) |h, i| {
+                    widths[i] = displayWidth(h);
+                }
+                for (rows) |row| {
+                    for (row, 0..) |value, i| {
+                        const dw = displayWidth(value);
+                        if (dw > widths[i]) widths[i] = dw;
+                    }
+                }
+                if (!config.no_header) {
+                    try writeTableRow(writer, out_headers, null, widths);
+                    try writeTableSeparator(writer, widths);
+                }
+                for (rows) |row| {
+                    try writeTableRow(writer, row, null, widths);
+                }
+            } else {
+                if (!config.no_header) try writeRecord(writer, out_headers, null, config.delimiter);
+                for (rows) |row| {
+                    try writeRecord(writer, row, null, config.delimiter);
+                }
+            }
+
+            try bw.flush();
+            return;
+        }
+
         while (true) {
-            const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            line_no += 1;
-            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
+            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
                 std.process.exit(1);
@@ -1915,8 +2213,8 @@ pub fn main() !void {
             }
             try writeTableRow(writer, agg_values, null, widths);
         } else {
-            if (!config.no_header) try writeRecord(writer, agg_headers, null);
-            try writeRecord(writer, agg_values, null);
+            if (!config.no_header) try writeRecord(writer, agg_headers, null, config.delimiter);
+            try writeRecord(writer, agg_values, null, config.delimiter);
         }
 
         try bw.flush();
@@ -1934,9 +2232,8 @@ pub fn main() !void {
 
         var rows_seen: usize = 0;
         while (true) {
-            const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            line_no += 1;
-            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
+            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
                 std.process.exit(1);
@@ -1959,7 +2256,7 @@ pub fn main() !void {
             rows_seen += 1;
         }
 
-        try writeSampleRows(prog_alloc, writer, header, col_indices, reservoir.items, config.table, config.no_header);
+        try writeSampleRows(prog_alloc, writer, header, col_indices, reservoir.items, config.table, !emit_input_header, config.delimiter);
         try bw.flush();
         return;
     }
@@ -1985,9 +2282,8 @@ pub fn main() !void {
             if (config.head) |limit| {
                 if (buffered_rows.items.len >= limit) break;
             }
-            const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            line_no += 1;
-            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
+            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
                 std.process.exit(1);
@@ -2019,7 +2315,7 @@ pub fn main() !void {
             }
         }
 
-        if (!config.no_header) {
+        if (emit_input_header) {
             try writeTableRow(writer, header, col_indices, widths);
             try writeTableSeparator(writer, widths);
         }
@@ -2036,9 +2332,8 @@ pub fn main() !void {
             if (config.head) |limit| {
                 if (rows_written >= limit) break;
             }
-            const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            line_no += 1;
-            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
+            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
                 std.process.exit(1);
@@ -2050,24 +2345,23 @@ pub fn main() !void {
             }
         }
     } else {
-        if (!config.no_header) {
-            try writeRecord(writer, header, col_indices);
+        if (emit_input_header) {
+            try writeRecord(writer, header, col_indices, config.delimiter);
         }
 
         while (true) {
             if (config.head) |limit| {
                 if (rows_written >= limit) break;
             }
-            const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            line_no += 1;
-            const result = parseRecord(line, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
+            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
                 std.process.exit(1);
             };
 
             if (passesFilters(config.filters, result.fields)) {
-                try writeRecordWithQuotedMask(writer, result.fields, result.quoted, col_indices);
+                try writeRecordWithQuotedMask(writer, result.fields, result.quoted, col_indices, config.delimiter);
                 rows_written += 1;
             }
         }
