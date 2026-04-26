@@ -1,6 +1,6 @@
 # zsv
 
-A fast, constant-memory CSV processor. Reads CSV from stdin, applies column selection and row filtering, and writes results to stdout.
+A fast, constant-memory CSV processor. Reads CSV from stdin or files, applies column selection and row filtering, and writes results to stdout.
 
 Written in Zig.
 
@@ -42,7 +42,7 @@ just test-e2e
 zsv [OPTIONS] [FILE...]
 ```
 
-If no files are provided, input is read from stdin. If multiple files are provided, they are processed in order and stacked into one CSV.
+If no files are provided, input is read from stdin. If multiple files are provided, they are processed in order and stacked into one CSV. Use `-` to mix stdin with files.
 
 ### Options
 
@@ -98,6 +98,12 @@ Process headerless input using 1-based column references:
 
 ```sh
 zsv --input-no-header -s 1,3 -f "2>100" < data.csv
+```
+
+Mix stdin with files:
+
+```sh
+zsv part1.csv - part2.csv
 ```
 
 Filter rows:
@@ -212,7 +218,7 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 
 ## Limitations
 
-- Input must be read from stdin (no filename argument).
+- Inputs must have matching headers when multiple files are provided.
 - Maximum line length is 1 MB. Lines exceeding this limit produce an error.
 - Maximum fields per row is 4096. Rows exceeding this limit produce an error.
 - Newlines within quoted fields are not supported (the parser splits on `\n` before parsing fields).
@@ -227,7 +233,6 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 
 ## Possible future enhancements
 
-- Read from a file argument instead of only stdin.
 - Custom field delimiter (`-d '\t'` for TSV, `-d '|'` for pipe-delimited, etc.).
 - Case-insensitive filtering.
 - Sorting by one or more columns.
