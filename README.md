@@ -230,10 +230,3 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 
 - CSV parse errors are reported to stderr with the line number and a short reason, and the process exits with a non-zero status.
 - The no-transform pass-through path (`zsv < file.csv` with no `--select`, `--filter`, or `--table`) streams lines without CSV field parsing, so malformed CSV rows are passed through as-is in that mode.
-
-## Possible future enhancements
-
-- Custom field delimiter (`-d '\t'` for TSV, `-d '|'` for pipe-delimited, etc.).
-- Case-insensitive filtering.
-- Sorting by one or more columns.
-- Support newlines within quoted fields (multi-line records).
