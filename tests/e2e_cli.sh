@@ -11,6 +11,17 @@ Dan,7,Ops
 '
 
 failures=0
+tmpdir="$(mktemp -d)"
+
+cleanup() {
+  rm -rf "$tmpdir"
+}
+
+trap cleanup EXIT
+
+printf 'name,score\nAlice,9\n' > "$tmpdir/part1.csv"
+printf 'name,score\nBob,8\nCara,10\n' > "$tmpdir/part2.csv"
+printf 'name,points\nMismatch,1\n' > "$tmpdir/bad.csv"
 
 run_case() {
   local name="$1"
@@ -166,6 +177,39 @@ if [[ "$actual_line_count" -eq 5 ]]; then
 else
   echo "[FAIL] sample: 100 rows from 4-row data returns 5 lines (got $actual_line_count)"
   failures=$((failures + 1))
+fi
+
+actual="$($exe "$tmpdir/part1.csv" "$tmpdir/part2.csv")"
+expected=$'name,score\nAlice,9\nBob,8\nCara,10'
+if [[ "$actual" == "$expected" ]]; then
+  echo "[PASS] file args: stacked CSVs share one header"
+else
+  echo "[FAIL] file args: stacked CSVs share one header"
+  echo "  expected:"
+  printf '%s\n' "$expected" | sed 's/^/    /'
+  echo "  actual:"
+  printf '%s\n' "$actual" | sed 's/^/    /'
+  failures=$((failures + 1))
+fi
+
+actual="$(printf 'name,score\nAlice,9\n' | "$exe" - "$tmpdir/part2.csv")"
+expected=$'name,score\nAlice,9\nBob,8\nCara,10'
+if [[ "$actual" == "$expected" ]]; then
+  echo "[PASS] file args: stdin can be mixed with files"
+else
+  echo "[FAIL] file args: stdin can be mixed with files"
+  echo "  expected:"
+  printf '%s\n' "$expected" | sed 's/^/    /'
+  echo "  actual:"
+  printf '%s\n' "$actual" | sed 's/^/    /'
+  failures=$((failures + 1))
+fi
+
+if "$exe" "$tmpdir/part1.csv" "$tmpdir/bad.csv" >/dev/null 2>&1; then
+  echo "[FAIL] file args: mismatched headers should fail"
+  failures=$((failures + 1))
+else
+  echo "[PASS] file args: mismatched headers should fail"
 fi
 
 if [[ "$failures" -ne 0 ]]; then

@@ -39,10 +39,10 @@ just test-e2e
 ## Usage
 
 ```
-zsv [OPTIONS]
+zsv [OPTIONS] [FILE...]
 ```
 
-All input is read from stdin and output is written to stdout.
+If no files are provided, input is read from stdin. If multiple files are provided, they are processed in order and stacked into one CSV.
 
 ### Options
 
@@ -67,7 +67,13 @@ All input is read from stdin and output is written to stdout.
 Pass through a CSV file:
 
 ```sh
-zsv < data.csv
+zsv data.csv
+```
+
+Stack multiple CSVs with the same header:
+
+```sh
+zsv part1.csv part2.csv part3.csv
 ```
 
 Select specific columns by name:

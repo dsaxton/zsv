@@ -44,6 +44,7 @@ const Config = struct {
     group_by: ?[]const []const u8 = null,
     filters: ?[]Filter = null,
     aggs: ?[]Agg = null,
+    inputs: ?[]const []const u8 = null,
     head: ?usize = null,
     top_field: ?[]const u8 = null,
     sample: ?usize = null,
@@ -71,8 +72,11 @@ fn parseRecordErrorMessage(err: ParseRecordError) []const u8 {
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
         \\Usage: zsv [OPTIONS]
+        \\       zsv [OPTIONS] [FILE...]
         \\
         \\Reads CSV from stdin and writes to stdout.
+        \\If FILEs are provided, they are processed in order and stacked as one CSV.
+        \\Use - to read from stdin in a file list.
         \\
         \\Options:
         \\  -s, --select FIELDS   Comma-separated column names or 1-based indices
@@ -106,6 +110,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
     var group_by = std.ArrayList([]const u8).init(allocator);
     var filters = std.ArrayList(Filter).init(allocator);
     var aggs = std.ArrayList(Agg).init(allocator);
+    var inputs = std.ArrayList([]const u8).init(allocator);
     var head: ?usize = null;
     var top_field: ?[]const u8 = null;
     var sample: ?usize = null;
@@ -114,21 +119,24 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
     var input_no_header = false;
     var table = false;
     var validate = false;
+    var positional_mode = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+        if (!positional_mode and std.mem.eql(u8, arg, "--")) {
+            positional_mode = true;
+        } else if (!positional_mode and (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help"))) {
             const stdout = std.io.getStdOut().writer();
             try printUsage(stdout);
             return null;
-        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--table")) {
+        } else if (!positional_mode and (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--table"))) {
             table = true;
-        } else if (std.mem.eql(u8, arg, "--no-header")) {
+        } else if (!positional_mode and std.mem.eql(u8, arg, "--no-header")) {
             no_header = true;
-        } else if (std.mem.eql(u8, arg, "--input-no-header")) {
+        } else if (!positional_mode and std.mem.eql(u8, arg, "--input-no-header")) {
             input_no_header = true;
-        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--delimiter")) {
+        } else if (!positional_mode and (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--delimiter"))) {
             if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --delimiter requires an argument\n");
@@ -140,7 +148,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
                 try stderr.print("Error: invalid --delimiter value: {s}\n", .{args[i]});
                 return null;
             };
-        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--select")) {
+        } else if (!positional_mode and (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--select"))) {
             if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --select requires an argument\n");
@@ -154,7 +162,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
                     try selectors.append(try allocator.dupe(u8, field));
                 }
             }
-        } else if (std.mem.eql(u8, arg, "--group-by")) {
+        } else if (!positional_mode and std.mem.eql(u8, arg, "--group-by")) {
             if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --group-by requires an argument\n");
@@ -168,7 +176,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
                     try group_by.append(try allocator.dupe(u8, field));
                 }
             }
-        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--filter")) {
+        } else if (!positional_mode and (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--filter"))) {
             if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --filter requires an argument\n");
@@ -185,7 +193,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             filter.field = try allocator.dupe(u8, parsed_filter.field);
             filter.value = try allocator.dupe(u8, parsed_filter.value);
             try filters.append(filter);
-        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--head")) {
+        } else if (!positional_mode and (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--head"))) {
             if (i + 1 >= args.len) {
                 head = default_head_rows;
             } else {
@@ -201,7 +209,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
                 };
                 i += 1;
             }
-        } else if (std.mem.eql(u8, arg, "--agg")) {
+        } else if (!positional_mode and std.mem.eql(u8, arg, "--agg")) {
             if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --agg requires an argument\n");
@@ -217,7 +225,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             var agg = parsed_agg;
             agg.field = try allocator.dupe(u8, parsed_agg.field);
             try aggs.append(agg);
-        } else if (std.mem.eql(u8, arg, "--top")) {
+        } else if (!positional_mode and std.mem.eql(u8, arg, "--top")) {
             if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --top requires an argument\n");
@@ -226,7 +234,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
             i += 1;
             const value = args[i];
             top_field = try allocator.dupe(u8, value);
-        } else if (std.mem.eql(u8, arg, "--sample")) {
+        } else if (!positional_mode and std.mem.eql(u8, arg, "--sample")) {
             if (i + 1 >= args.len) {
                 const stderr = std.io.getStdErr().writer();
                 try stderr.writeAll("Error: --sample requires an argument\n");
@@ -244,8 +252,11 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
                 return null;
             }
             sample = n;
-        } else if (std.mem.eql(u8, arg, "--validate")) {
+        } else if (!positional_mode and std.mem.eql(u8, arg, "--validate")) {
             validate = true;
+        } else if (std.mem.eql(u8, arg, "-") or arg.len == 0 or arg[0] != '-' or positional_mode) {
+            positional_mode = true;
+            try inputs.append(try allocator.dupe(u8, arg));
         } else {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("Error: unknown argument: {s}\n", .{arg});
@@ -329,6 +340,7 @@ fn parseArgsList(args: []const []const u8, allocator: std.mem.Allocator) !?Confi
         .group_by = if (group_by.items.len > 0) group_by.items else null,
         .filters = if (filters.items.len > 0) filters.items else null,
         .aggs = if (aggs.items.len > 0) aggs.items else null,
+        .inputs = if (inputs.items.len > 0) inputs.items else null,
         .head = head,
         .top_field = top_field,
         .sample = sample,
@@ -985,6 +997,114 @@ fn makeSyntheticHeader(allocator: std.mem.Allocator, count: usize) ![]const []co
         field.* = try std.fmt.allocPrint(allocator, "{d}", .{i + 1});
     }
     return header;
+}
+
+const InputSchema = struct {
+    header: ?[]const []const u8 = null,
+    cols: usize = 0,
+};
+
+fn headersMatch(expected: []const []const u8, actual: []const []const u8) bool {
+    if (expected.len != actual.len) return false;
+    for (expected, actual) |a, b| {
+        if (!std.mem.eql(u8, a, b)) return false;
+    }
+    return true;
+}
+
+fn printParseError(source_name: []const u8, line_no: usize, err: ParseRecordError) !void {
+    const stderr = std.io.getStdErr().writer();
+    try stderr.print("Error parsing CSV in {s} on line {d}: {s}\n", .{ source_name, line_no, parseRecordErrorMessage(err) });
+}
+
+fn printReadError(source_name: []const u8, line_no: usize, err: anyerror) !void {
+    const stderr = std.io.getStdErr().writer();
+    if (err == error.LineTooLong) {
+        try stderr.print("Error reading line {d} in {s}: line too long\n", .{ line_no, source_name });
+        return;
+    }
+    return err;
+}
+
+fn initInputSource(
+    allocator: std.mem.Allocator,
+    reader: anytype,
+    source_name: []const u8,
+    config: Config,
+    schema: *InputSchema,
+    line_buf: []u8,
+    field_buf: *[max_fields][]const u8,
+    quoted_buf: *[max_fields]bool,
+    quote_buf: []u8,
+    pending_first_data: *?[]const u8,
+    line_no: *usize,
+) !bool {
+    const first_line = readNextLine(reader, line_buf) catch |err| {
+        try printReadError(source_name, 1, err);
+        return false;
+    } orelse return false;
+
+    const header_line_copy = try allocator.dupe(u8, first_line);
+    const result = parseRecord(header_line_copy, config.delimiter, field_buf, quoted_buf, quote_buf) catch |err| {
+        try printParseError(source_name, 1, err);
+        std.process.exit(1);
+    };
+
+    if (config.input_no_header) {
+        if (schema.header == null) {
+            schema.header = try makeSyntheticHeader(allocator, result.fields.len);
+            schema.cols = result.fields.len;
+        } else if (result.fields.len != schema.cols) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Error: column count mismatch in {s}: expected {d}, got {d}\n", .{ source_name, schema.cols, result.fields.len });
+            std.process.exit(1);
+        }
+        pending_first_data.* = header_line_copy;
+        line_no.* = 0;
+        return true;
+    }
+
+    if (schema.header == null) {
+        const header = try allocator.alloc([]const u8, result.fields.len);
+        for (result.fields, 0..) |field, i| {
+            header[i] = try allocator.dupe(u8, field);
+        }
+        schema.header = header;
+        schema.cols = result.fields.len;
+    } else if (!headersMatch(schema.header.?, result.fields)) {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.print("Error: header mismatch in {s}\n", .{source_name});
+        std.process.exit(1);
+    }
+
+    line_no.* = 1;
+    return true;
+}
+
+fn consumeDataRows(
+    reader: anytype,
+    source_name: []const u8,
+    config: Config,
+    line_buf: []u8,
+    field_buf: *[max_fields][]const u8,
+    quoted_buf: *[max_fields]bool,
+    quote_buf: []u8,
+    pending_first_data: *?[]const u8,
+    line_no: *usize,
+    ctx: anytype,
+    comptime rowFn: fn (@TypeOf(ctx), []const u8, usize, []const []const u8, []const bool) anyerror!void,
+) !void {
+    while (true) {
+        const line = readDataLine(reader, line_buf, pending_first_data, line_no) catch |err| {
+            try printReadError(source_name, line_no.* + 1, err);
+            return;
+        } orelse break;
+        const result = parseRecord(line, config.delimiter, field_buf, quoted_buf, quote_buf) catch |err| {
+            try printParseError(source_name, line_no.*, err);
+            std.process.exit(1);
+        };
+        try rowFn(ctx, source_name, line_no.*, result.fields, result.quoted);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1872,11 +1992,9 @@ pub fn main() !void {
     const prog_alloc = prog_arena.allocator();
 
     const config = try parseArgs(prog_alloc) orelse return;
+    const emit_input_header = !config.input_no_header and !config.no_header;
 
     const stdin = std.io.getStdIn();
-    var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
-    var reader = br.reader();
-
     const stdout = std.io.getStdOut();
     var bw = std.io.bufferedWriter(stdout.writer());
     const writer = bw.writer();
@@ -1886,51 +2004,67 @@ pub fn main() !void {
     var quoted_buf: [max_fields]bool = undefined;
     var quote_buf: [max_line_len]u8 = undefined;
 
-    const header_line = readNextLine(&reader, &line_buf) catch {
-        const stderr = std.io.getStdErr().writer();
-        try stderr.writeAll("Error reading header: line too long\n");
-        return;
-    } orelse return;
+    const input_paths = config.inputs orelse &[_][]const u8{"-"};
+
+    var schema = InputSchema{};
     var rows_written: usize = 0;
 
     if (config.validate) {
-        const header_result = parseRecord(header_line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-            const stderr = std.io.getStdErr().writer();
-            if (config.input_no_header) {
-                try stderr.print("Error parsing CSV on line 1: {s}\n", .{parseRecordErrorMessage(err)});
-            } else {
-                try stderr.print("Error parsing CSV header: {s}\n", .{parseRecordErrorMessage(err)});
-            }
-            std.process.exit(1);
-        };
-        const expected_cols = header_result.fields.len;
-        var line_no: usize = 1;
-        var rows_seen: usize = if (config.input_no_header) 1 else 0;
+        var rows_seen: usize = 0;
+        for (input_paths) |input_path| {
+            var file: ?std.fs.File = null;
+            defer if (file) |f| f.close();
 
-        while (true) {
-            const line = readNextLine(&reader, &line_buf) catch |err| {
-                const stderr = std.io.getStdErr().writer();
-                if (err == error.LineTooLong) {
-                    try stderr.print("Error reading line {d}: line too long\n", .{line_no + 1});
-                    std.process.exit(1);
+            if (std.mem.eql(u8, input_path, "-")) {
+                var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, "stdin", config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+
+                while (true) {
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError("stdin", line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError("stdin", line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (result.fields.len != schema.cols) {
+                        const stderr = std.io.getStdErr().writer();
+                        try stderr.print("Error: column count mismatch in stdin on line {d}: expected {d}, got {d}\n", .{ line_no, schema.cols, result.fields.len });
+                        std.process.exit(1);
+                    }
+                    rows_seen += 1;
                 }
-                return err;
-            } orelse break;
-            line_no += 1;
-            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
-                std.process.exit(1);
-            };
-            if (result.fields.len != expected_cols) {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print(
-                    "Error: column count mismatch on line {d}: expected {d}, got {d}\n",
-                    .{ line_no, expected_cols, result.fields.len },
-                );
-                std.process.exit(1);
+            } else {
+                file = try std.fs.cwd().openFile(input_path, .{});
+                var br = std.io.bufferedReaderSize(read_buf_size, file.?.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, input_path, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+
+                while (true) {
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(input_path, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(input_path, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (result.fields.len != schema.cols) {
+                        const stderr = std.io.getStdErr().writer();
+                        try stderr.print("Error: column count mismatch in {s} on line {d}: expected {d}, got {d}\n", .{ input_path, line_no, schema.cols, result.fields.len });
+                        std.process.exit(1);
+                    }
+                    rows_seen += 1;
+                }
             }
-            rows_seen += 1;
         }
 
         try writer.print("Valid: {d} row(s)\n", .{rows_seen});
@@ -1939,81 +2073,230 @@ pub fn main() !void {
     }
 
     if (!config.table and config.selectors == null and config.filters == null and config.top_field == null and config.aggs == null and config.sample == null) {
-        if (!config.input_no_header and !config.no_header) {
-            try writer.writeAll(header_line);
-            try writer.writeByte('\n');
-        } else if (config.input_no_header) {
-            if (config.head == null or config.head.? > 0) {
-                try writer.writeAll(header_line);
-                try writer.writeByte('\n');
-                rows_written += 1;
+        if (config.input_no_header) {
+            for (input_paths) |input_path| {
+                var file: ?std.fs.File = null;
+                defer if (file) |f| f.close();
+
+                if (std.mem.eql(u8, input_path, "-")) {
+                    var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
+                    const reader = br.reader();
+                    while (true) {
+                        if (config.head) |limit| {
+                            if (rows_written >= limit) break;
+                        }
+                        const line = readNextLine(reader, &line_buf) catch break orelse break;
+                        try writer.writeAll(line);
+                        try writer.writeByte('\n');
+                        rows_written += 1;
+                    }
+                } else {
+                    file = try std.fs.cwd().openFile(input_path, .{});
+                    var br = std.io.bufferedReaderSize(read_buf_size, file.?.reader());
+                    const reader = br.reader();
+                    while (true) {
+                        if (config.head) |limit| {
+                            if (rows_written >= limit) break;
+                        }
+                        const line = readNextLine(reader, &line_buf) catch break orelse break;
+                        try writer.writeAll(line);
+                        try writer.writeByte('\n');
+                        rows_written += 1;
+                    }
+                }
             }
+
+            try bw.flush();
+            return;
         }
 
-        while (true) {
-            if (config.head) |limit| {
-                if (rows_written >= limit) break;
+        var header_emitted = false;
+        for (input_paths) |input_path| {
+            var file: ?std.fs.File = null;
+            defer if (file) |f| f.close();
+
+            const source_name = if (std.mem.eql(u8, input_path, "-")) "stdin" else input_path;
+            if (std.mem.eql(u8, input_path, "-")) {
+                var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!header_emitted and !config.no_header) {
+                    try writeRecord(writer, schema.header.?, null, config.delimiter);
+                    header_emitted = true;
+                }
+
+                while (true) {
+                    if (config.head) |limit| {
+                        if (rows_written >= limit) break;
+                    }
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
+                    try writer.writeAll(line);
+                    try writer.writeByte('\n');
+                    rows_written += 1;
+                }
+            } else {
+                file = try std.fs.cwd().openFile(input_path, .{});
+                var br = std.io.bufferedReaderSize(read_buf_size, file.?.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!header_emitted and !config.no_header) {
+                    try writeRecord(writer, schema.header.?, null, config.delimiter);
+                    header_emitted = true;
+                }
+
+                while (true) {
+                    if (config.head) |limit| {
+                        if (rows_written >= limit) break;
+                    }
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
+                    try writer.writeAll(line);
+                    try writer.writeByte('\n');
+                    rows_written += 1;
+                }
             }
-            const line = readNextLine(&reader, &line_buf) catch break orelse break;
-            try writer.writeAll(line);
-            try writer.writeByte('\n');
-            rows_written += 1;
         }
 
         try bw.flush();
         return;
     }
 
-    // Header/first-data line must be heap-duped since line_buf will be reused.
-    const header_line_copy = try prog_alloc.dupe(u8, header_line);
-    const first_result = parseRecord(header_line_copy, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-        const stderr = std.io.getStdErr().writer();
-        if (config.input_no_header) {
-            try stderr.print("Error parsing CSV on line 1: {s}\n", .{parseRecordErrorMessage(err)});
-        } else {
-            try stderr.print("Error parsing CSV header: {s}\n", .{parseRecordErrorMessage(err)});
-        }
-        std.process.exit(1);
-    };
-    const header = if (config.input_no_header) try makeSyntheticHeader(prog_alloc, first_result.fields.len) else blk: {
-        const real_header = try prog_alloc.alloc([]const u8, first_result.fields.len);
-        for (first_result.fields, 0..) |field, i| {
-            real_header[i] = try prog_alloc.dupe(u8, field);
-        }
-        break :blk real_header;
-    };
-    var pending_first_data: ?[]const u8 = null;
-    var line_no: usize = 1;
-    if (config.input_no_header) {
-        pending_first_data = header_line_copy;
-        line_no = 0;
-    }
-    const emit_input_header = !config.input_no_header and !config.no_header;
-
+    var header_ready = false;
     var col_indices: ?[]usize = null;
-    if (config.selectors) |selectors| {
-        const indices = try prog_alloc.alloc(usize, selectors.len);
-        for (selectors, 0..) |sel, i| {
-            indices[i] = try resolveColumnIndex(header, sel);
-        }
-        col_indices = indices;
+    var top_col_index: ?usize = null;
+
+    if (top_col_index == null and config.top_field != null) {}
+
+    if (config.top_field == null and config.aggs == null and config.sample == null and !config.table) {
+        // no-op
     }
 
-    if (config.filters) |filters| {
-        for (filters) |*f| {
-            f.col_index = try resolveColumnIndex(header, f.field);
-        }
+    if (config.top_field) |name| {
+        // resolved after the first non-empty source is initialized
+        _ = name;
     }
 
-    const top_col_index: ?usize = if (config.top_field) |name| try resolveColumnIndex(header, name) else null;
+    if (config.aggs) |aggs| {
+        _ = aggs;
+    }
 
-    if (top_col_index) |top_idx| {
-        const limit = config.head orelse default_head_rows;
-        if (limit == 0) {
-            try bw.flush();
-            return;
+    if (config.sample) |sample_n| {
+        var reservoir = std.ArrayList(SampleRow).init(allocator);
+        defer {
+            for (reservoir.items) |row| {
+                freeClonedFields(allocator, row.fields);
+            }
+            reservoir.deinit();
         }
 
+        var sample_header_ready = false;
+        var rows_seen: usize = 0;
+        for (input_paths) |input_path| {
+            var file: ?std.fs.File = null;
+            defer if (file) |f| f.close();
+
+            const source_name = if (std.mem.eql(u8, input_path, "-")) "stdin" else input_path;
+            if (std.mem.eql(u8, input_path, "-")) {
+                var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!sample_header_ready) {
+                    if (config.selectors) |selectors| {
+                        const indices = try prog_alloc.alloc(usize, selectors.len);
+                        for (selectors, 0..) |sel, i| indices[i] = try resolveColumnIndex(schema.header.?, sel);
+                        col_indices = indices;
+                    }
+                    if (config.filters) |filters| {
+                        for (filters) |*f| f.col_index = try resolveColumnIndex(schema.header.?, f.field);
+                    }
+                    sample_header_ready = true;
+                }
+
+                while (true) {
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (!passesFilters(config.filters, result.fields)) continue;
+
+                    if (reservoir.items.len < sample_n) {
+                        const duped = try cloneFields(allocator, result.fields);
+                        try reservoir.append(.{ .fields = duped });
+                    } else {
+                        const j = std.crypto.random.intRangeLessThan(usize, 0, rows_seen + 1);
+                        if (j < sample_n) {
+                            const duped = try cloneFields(allocator, result.fields);
+                            freeClonedFields(allocator, reservoir.items[j].fields);
+                            reservoir.items[j] = .{ .fields = duped };
+                        }
+                    }
+                    rows_seen += 1;
+                }
+            } else {
+                file = try std.fs.cwd().openFile(input_path, .{});
+                var br = std.io.bufferedReaderSize(read_buf_size, file.?.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!sample_header_ready) {
+                    if (config.selectors) |selectors| {
+                        const indices = try prog_alloc.alloc(usize, selectors.len);
+                        for (selectors, 0..) |sel, i| indices[i] = try resolveColumnIndex(schema.header.?, sel);
+                        col_indices = indices;
+                    }
+                    if (config.filters) |filters| {
+                        for (filters) |*f| f.col_index = try resolveColumnIndex(schema.header.?, f.field);
+                    }
+                    sample_header_ready = true;
+                }
+
+                while (true) {
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (!passesFilters(config.filters, result.fields)) continue;
+
+                    if (reservoir.items.len < sample_n) {
+                        const duped = try cloneFields(allocator, result.fields);
+                        try reservoir.append(.{ .fields = duped });
+                    } else {
+                        const j = std.crypto.random.intRangeLessThan(usize, 0, rows_seen + 1);
+                        if (j < sample_n) {
+                            const duped = try cloneFields(allocator, result.fields);
+                            freeClonedFields(allocator, reservoir.items[j].fields);
+                            reservoir.items[j] = .{ .fields = duped };
+                        }
+                    }
+                    rows_seen += 1;
+                }
+            }
+        }
+
+        try writeSampleRows(prog_alloc, writer, schema.header.?, col_indices, reservoir.items, config.table, !emit_input_header, config.delimiter);
+        try bw.flush();
+        return;
+    }
+
+    if (config.top_field != null) {
         var top_rows = std.ArrayList(TopRow).init(allocator);
         defer {
             for (top_rows.items) |row| {
@@ -2022,31 +2305,117 @@ pub fn main() !void {
             top_rows.deinit();
         }
 
-        while (true) {
-            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
-            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
-                std.process.exit(1);
-            };
+        const limit = config.head orelse default_head_rows;
+        if (limit == 0) {
+            try bw.flush();
+            return;
+        }
 
-            if (!passesFilters(config.filters, result.fields)) continue;
+        for (input_paths) |input_path| {
+            var file: ?std.fs.File = null;
+            defer if (file) |f| f.close();
 
-            const key = if (top_idx < result.fields.len) result.fields[top_idx] else "";
-            const key_num = std.fmt.parseFloat(f64, key) catch null;
+            const source_name = if (std.mem.eql(u8, input_path, "-")) "stdin" else input_path;
+            if (std.mem.eql(u8, input_path, "-")) {
+                var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
 
-            if (top_rows.items.len < limit) {
-                const duped = try cloneFields(allocator, result.fields);
-                const duped_key = if (top_idx < duped.len) duped[top_idx] else "";
-                try top_rows.append(.{ .fields = duped, .key = duped_key, .key_num = key_num });
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!header_ready) {
+                    const indices = if (config.selectors) |selectors| blk: {
+                        const tmp = try prog_alloc.alloc(usize, selectors.len);
+                        for (selectors, 0..) |sel, i| tmp[i] = try resolveColumnIndex(schema.header.?, sel);
+                        break :blk tmp;
+                    } else null;
+                    col_indices = indices;
+                    if (config.filters) |filters| {
+                        for (filters) |*f| f.col_index = try resolveColumnIndex(schema.header.?, f.field);
+                    }
+                    top_col_index = try resolveColumnIndex(schema.header.?, config.top_field.?);
+                    header_ready = true;
+                }
+
+                while (true) {
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (!passesFilters(config.filters, result.fields)) continue;
+                    const top_idx = top_col_index.?;
+                    const key = if (top_idx < result.fields.len) result.fields[top_idx] else "";
+                    const key_num = std.fmt.parseFloat(f64, key) catch null;
+
+                    if (top_rows.items.len < limit) {
+                        const duped = try cloneFields(allocator, result.fields);
+                        const duped_key = if (top_idx < duped.len) duped[top_idx] else "";
+                        try top_rows.append(.{ .fields = duped, .key = duped_key, .key_num = key_num });
+                    } else {
+                        const wi = worstTopIndex(top_rows.items);
+                        const worst = top_rows.items[wi];
+                        if (compareTopKeys(key_num, key, worst.key_num, worst.key) == .gt) {
+                            const duped = try cloneFields(allocator, result.fields);
+                            const duped_key = if (top_idx < duped.len) duped[top_idx] else "";
+                            freeClonedFields(allocator, worst.fields);
+                            top_rows.items[wi] = .{ .fields = duped, .key = duped_key, .key_num = key_num };
+                        }
+                    }
+                }
             } else {
-                const wi = worstTopIndex(top_rows.items);
-                const worst = top_rows.items[wi];
-                if (compareTopKeys(key_num, key, worst.key_num, worst.key) == .gt) {
-                    const duped = try cloneFields(allocator, result.fields);
-                    const duped_key = if (top_idx < duped.len) duped[top_idx] else "";
-                    freeClonedFields(allocator, worst.fields);
-                    top_rows.items[wi] = .{ .fields = duped, .key = duped_key, .key_num = key_num };
+                file = try std.fs.cwd().openFile(input_path, .{});
+                var br = std.io.bufferedReaderSize(read_buf_size, file.?.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!header_ready) {
+                    const indices = if (config.selectors) |selectors| blk: {
+                        const tmp = try prog_alloc.alloc(usize, selectors.len);
+                        for (selectors, 0..) |sel, i| tmp[i] = try resolveColumnIndex(schema.header.?, sel);
+                        break :blk tmp;
+                    } else null;
+                    col_indices = indices;
+                    if (config.filters) |filters| {
+                        for (filters) |*f| f.col_index = try resolveColumnIndex(schema.header.?, f.field);
+                    }
+                    top_col_index = try resolveColumnIndex(schema.header.?, config.top_field.?);
+                    header_ready = true;
+                }
+
+                while (true) {
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (!passesFilters(config.filters, result.fields)) continue;
+                    const top_idx = top_col_index.?;
+                    const key = if (top_idx < result.fields.len) result.fields[top_idx] else "";
+                    const key_num = std.fmt.parseFloat(f64, key) catch null;
+
+                    if (top_rows.items.len < limit) {
+                        const duped = try cloneFields(allocator, result.fields);
+                        const duped_key = if (top_idx < duped.len) duped[top_idx] else "";
+                        try top_rows.append(.{ .fields = duped, .key = duped_key, .key_num = key_num });
+                    } else {
+                        const wi = worstTopIndex(top_rows.items);
+                        const worst = top_rows.items[wi];
+                        if (compareTopKeys(key_num, key, worst.key_num, worst.key) == .gt) {
+                            const duped = try cloneFields(allocator, result.fields);
+                            const duped_key = if (top_idx < duped.len) duped[top_idx] else "";
+                            freeClonedFields(allocator, worst.fields);
+                            top_rows.items[wi] = .{ .fields = duped, .key = duped_key, .key_num = key_num };
+                        }
+                    }
                 }
             }
         }
@@ -2057,67 +2426,162 @@ pub fn main() !void {
             }
         }.lessThan);
 
-        try writeTopRows(prog_alloc, writer, header, col_indices, top_rows.items, config.table, !emit_input_header, config.delimiter);
-
+        try writeTopRows(prog_alloc, writer, schema.header.?, col_indices, top_rows.items, config.table, !emit_input_header, config.delimiter);
         try bw.flush();
         return;
     }
 
     if (config.aggs) |aggs| {
-        for (aggs) |*agg| {
-            agg.col_index = try resolveColumnIndex(header, agg.field);
+        var group_indices: ?[]usize = null;
+        var any_tainted = try prog_alloc.alloc(bool, aggs.len);
+        @memset(any_tainted, false);
+
+        var groups = std.ArrayList(GroupRow).init(prog_alloc);
+        defer {
+            for (groups.items) |group| {
+                for (group.values) |value| prog_alloc.free(value);
+                prog_alloc.free(group.values);
+                for (group.aggs) |agg| _ = agg;
+                prog_alloc.free(group.aggs);
+            }
+            groups.deinit();
         }
 
-        if (config.group_by) |group_by| {
-            const group_indices = try prog_alloc.alloc(usize, group_by.len);
-            for (group_by, 0..) |field, i| {
-                group_indices[i] = try resolveColumnIndex(header, field);
-            }
+        var group_lookup = std.StringHashMap(usize).init(prog_alloc);
+        defer {
+            var it = group_lookup.keyIterator();
+            while (it.next()) |key| prog_alloc.free(key.*);
+            group_lookup.deinit();
+        }
 
-            var groups = std.ArrayList(GroupRow).init(prog_alloc);
-            var group_lookup = std.StringHashMap(usize).init(prog_alloc);
-            var any_tainted = try prog_alloc.alloc(bool, aggs.len);
-            @memset(any_tainted, false);
+        var agg_header_ready = false;
+        for (input_paths) |input_path| {
+            var file: ?std.fs.File = null;
+            defer if (file) |f| f.close();
 
-            while (true) {
-                const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
-                const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-                    const stderr = std.io.getStdErr().writer();
-                    try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
-                    std.process.exit(1);
-                };
-                if (!passesFilters(config.filters, result.fields)) continue;
+            const source_name = if (std.mem.eql(u8, input_path, "-")) "stdin" else input_path;
+            if (std.mem.eql(u8, input_path, "-")) {
+                var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
 
-                const key = try makeGroupKey(allocator, result.fields, group_indices);
-                const group_index = if (group_lookup.get(key)) |idx| blk: {
-                    allocator.free(key);
-                    break :blk idx;
-                } else blk: {
-                    const idx = groups.items.len;
-                    const persisted_key = try prog_alloc.dupe(u8, key);
-                    allocator.free(key);
-                    try groups.append(.{
-                        .values = try cloneGroupValues(prog_alloc, result.fields, group_indices),
-                        .aggs = try cloneAggSpecs(prog_alloc, aggs),
-                    });
-                    try group_lookup.put(persisted_key, idx);
-                    break :blk idx;
-                };
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!agg_header_ready) {
+                    for (aggs) |*agg| agg.col_index = try resolveColumnIndex(schema.header.?, agg.field);
+                    if (config.group_by) |group_by| {
+                        const idxs = try prog_alloc.alloc(usize, group_by.len);
+                        for (group_by, 0..) |field, i| idxs[i] = try resolveColumnIndex(schema.header.?, field);
+                        group_indices = idxs;
+                    }
+                    agg_header_ready = true;
+                }
 
-                for (groups.items[group_index].aggs, 0..) |*agg, i| {
-                    const col = agg.col_index orelse continue;
-                    if (col < result.fields.len) updateAgg(agg, result.fields[col]);
-                    if (agg.tainted) any_tainted[i] = true;
+                while (true) {
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (!passesFilters(config.filters, result.fields)) continue;
+                    if (group_indices) |gidx| {
+                        const key = try makeGroupKey(allocator, result.fields, gidx);
+                        const group_index = if (group_lookup.get(key)) |idx| blk: {
+                            allocator.free(key);
+                            break :blk idx;
+                        } else blk: {
+                            const idx = groups.items.len;
+                            const persisted_key = try prog_alloc.dupe(u8, key);
+                            allocator.free(key);
+                            try groups.append(.{
+                                .values = try cloneGroupValues(prog_alloc, result.fields, gidx),
+                                .aggs = try cloneAggSpecs(prog_alloc, aggs),
+                            });
+                            try group_lookup.put(persisted_key, idx);
+                            break :blk idx;
+                        };
+
+                        for (groups.items[group_index].aggs, 0..) |*agg, i| {
+                            const col = agg.col_index orelse continue;
+                            if (col < result.fields.len) updateAgg(agg, result.fields[col]);
+                            if (agg.tainted) any_tainted[i] = true;
+                        }
+                    } else {
+                        for (aggs) |*agg| {
+                            const col = agg.col_index orelse continue;
+                            if (col < result.fields.len) updateAgg(agg, result.fields[col]);
+                        }
+                    }
+                }
+            } else {
+                file = try std.fs.cwd().openFile(input_path, .{});
+                var br = std.io.bufferedReaderSize(read_buf_size, file.?.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!agg_header_ready) {
+                    for (aggs) |*agg| agg.col_index = try resolveColumnIndex(schema.header.?, agg.field);
+                    if (config.group_by) |group_by| {
+                        const idxs = try prog_alloc.alloc(usize, group_by.len);
+                        for (group_by, 0..) |field, i| idxs[i] = try resolveColumnIndex(schema.header.?, field);
+                        group_indices = idxs;
+                    }
+                    agg_header_ready = true;
+                }
+
+                while (true) {
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (!passesFilters(config.filters, result.fields)) continue;
+                    if (group_indices) |gidx| {
+                        const key = try makeGroupKey(allocator, result.fields, gidx);
+                        const group_index = if (group_lookup.get(key)) |idx| blk: {
+                            allocator.free(key);
+                            break :blk idx;
+                        } else blk: {
+                            const idx = groups.items.len;
+                            const persisted_key = try prog_alloc.dupe(u8, key);
+                            allocator.free(key);
+                            try groups.append(.{
+                                .values = try cloneGroupValues(prog_alloc, result.fields, gidx),
+                                .aggs = try cloneAggSpecs(prog_alloc, aggs),
+                            });
+                            try group_lookup.put(persisted_key, idx);
+                            break :blk idx;
+                        };
+
+                        for (groups.items[group_index].aggs, 0..) |*agg, i| {
+                            const col = agg.col_index orelse continue;
+                            if (col < result.fields.len) updateAgg(agg, result.fields[col]);
+                            if (agg.tainted) any_tainted[i] = true;
+                        }
+                    } else {
+                        for (aggs) |*agg| {
+                            const col = agg.col_index orelse continue;
+                            if (col < result.fields.len) updateAgg(agg, result.fields[col]);
+                        }
+                    }
                 }
             }
+        }
 
-            const output_cols = group_by.len + aggs.len;
+        if (group_indices) |gidx| {
+            const output_cols = gidx.len + aggs.len;
             const out_headers = try prog_alloc.alloc([]const u8, output_cols);
-            for (group_indices, 0..) |idx, i| {
-                out_headers[i] = header[idx];
-            }
+            for (gidx, 0..) |idx, i| out_headers[i] = schema.header.?[idx];
             for (aggs, 0..) |*agg, i| {
-                out_headers[group_by.len + i] = try std.fmt.allocPrint(prog_alloc, "{s}({s})", .{ @tagName(agg.func), agg.field });
+                out_headers[gidx.len + i] = try std.fmt.allocPrint(prog_alloc, "{s}({s})", .{ @tagName(agg.func), agg.field });
             }
 
             const stderr = std.io.getStdErr().writer();
@@ -2130,11 +2594,9 @@ pub fn main() !void {
             const rows = try prog_alloc.alloc([]const []const u8, groups.items.len);
             for (groups.items, 0..) |*group, row_i| {
                 const row = try prog_alloc.alloc([]const u8, output_cols);
-                for (group.values, 0..) |value, i| {
-                    row[i] = value;
-                }
+                for (group.values, 0..) |value, i| row[i] = value;
                 for (group.aggs, 0..) |*agg, i| {
-                    row[group_by.len + i] = if (agg.func == .count)
+                    row[gidx.len + i] = if (agg.func == .count)
                         try std.fmt.allocPrint(prog_alloc, "{d}", .{agg.n})
                     else if (agg.tainted)
                         ""
@@ -2146,9 +2608,7 @@ pub fn main() !void {
 
             if (config.table) {
                 const widths = try prog_alloc.alloc(usize, output_cols);
-                for (out_headers, 0..) |h, i| {
-                    widths[i] = displayWidth(h);
-                }
+                for (out_headers, 0..) |h, i| widths[i] = displayWidth(h);
                 for (rows) |row| {
                     for (row, 0..) |value, i| {
                         const dw = displayWidth(value);
@@ -2159,165 +2619,208 @@ pub fn main() !void {
                     try writeTableRow(writer, out_headers, null, widths);
                     try writeTableSeparator(writer, widths);
                 }
-                for (rows) |row| {
-                    try writeTableRow(writer, row, null, widths);
-                }
+                for (rows) |row| try writeTableRow(writer, row, null, widths);
             } else {
                 if (!config.no_header) try writeRecord(writer, out_headers, null, config.delimiter);
-                for (rows) |row| {
-                    try writeRecord(writer, row, null, config.delimiter);
-                }
+                for (rows) |row| try writeRecord(writer, row, null, config.delimiter);
             }
-
-            try bw.flush();
-            return;
-        }
-
-        while (true) {
-            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
-            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
-                std.process.exit(1);
-            };
-            if (!passesFilters(config.filters, result.fields)) continue;
-            for (aggs) |*agg| {
-                const col = agg.col_index orelse continue;
-                if (col < result.fields.len) updateAgg(agg, result.fields[col]);
-            }
-        }
-
-        const agg_headers = try prog_alloc.alloc([]const u8, aggs.len);
-        const agg_values = try prog_alloc.alloc([]const u8, aggs.len);
-        const stderr = std.io.getStdErr().writer();
-        for (aggs, 0..) |*agg, i| {
-            agg_headers[i] = try std.fmt.allocPrint(prog_alloc, "{s}({s})", .{ @tagName(agg.func), agg.field });
-            if (agg.func == .count) {
-                agg_values[i] = try std.fmt.allocPrint(prog_alloc, "{d}", .{agg.n});
-            } else if (agg.tainted) {
-                try stderr.print("Warning: {s}({s}): non-numeric values encountered\n", .{ @tagName(agg.func), agg.field });
-                agg_values[i] = "";
-            } else {
-                agg_values[i] = try std.fmt.allocPrint(prog_alloc, "{d}", .{aggResult(agg)});
-            }
-        }
-
-        if (config.table) {
-            const widths = try prog_alloc.alloc(usize, aggs.len);
-            for (aggs, 0..) |_, i| {
-                widths[i] = @max(displayWidth(agg_headers[i]), displayWidth(agg_values[i]));
-            }
-            if (!config.no_header) {
-                try writeTableRow(writer, agg_headers, null, widths);
-                try writeTableSeparator(writer, widths);
-            }
-            try writeTableRow(writer, agg_values, null, widths);
         } else {
-            if (!config.no_header) try writeRecord(writer, agg_headers, null, config.delimiter);
-            try writeRecord(writer, agg_values, null, config.delimiter);
-        }
-
-        try bw.flush();
-        return;
-    }
-
-    if (config.sample) |sample_n| {
-        var reservoir = std.ArrayList(SampleRow).init(allocator);
-        defer {
-            for (reservoir.items) |row| {
-                freeClonedFields(allocator, row.fields);
-            }
-            reservoir.deinit();
-        }
-
-        var rows_seen: usize = 0;
-        while (true) {
-            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
-            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
-                std.process.exit(1);
-            };
-            if (!passesFilters(config.filters, result.fields)) continue;
-
-            if (reservoir.items.len < sample_n) {
-                // Fill phase
-                const duped = try cloneFields(allocator, result.fields);
-                try reservoir.append(.{ .fields = duped });
-            } else {
-                // Replace phase: j uniform in [0, rows_seen]
-                const j = std.crypto.random.intRangeLessThan(usize, 0, rows_seen + 1);
-                if (j < sample_n) {
-                    const duped = try cloneFields(allocator, result.fields);
-                    freeClonedFields(allocator, reservoir.items[j].fields);
-                    reservoir.items[j] = .{ .fields = duped };
+            const agg_headers = try prog_alloc.alloc([]const u8, aggs.len);
+            const agg_values = try prog_alloc.alloc([]const u8, aggs.len);
+            const stderr = std.io.getStdErr().writer();
+            for (aggs, 0..) |*agg, i| {
+                agg_headers[i] = try std.fmt.allocPrint(prog_alloc, "{s}({s})", .{ @tagName(agg.func), agg.field });
+                if (agg.func == .count) {
+                    agg_values[i] = try std.fmt.allocPrint(prog_alloc, "{d}", .{agg.n});
+                } else if (agg.tainted) {
+                    try stderr.print("Warning: {s}({s}): non-numeric values encountered\n", .{ @tagName(agg.func), agg.field });
+                    agg_values[i] = "";
+                } else {
+                    agg_values[i] = try std.fmt.allocPrint(prog_alloc, "{d}", .{aggResult(agg)});
                 }
             }
-            rows_seen += 1;
+
+            if (config.table) {
+                const widths = try prog_alloc.alloc(usize, aggs.len);
+                for (aggs, 0..) |_, i| widths[i] = @max(displayWidth(agg_headers[i]), displayWidth(agg_values[i]));
+                if (!config.no_header) {
+                    try writeTableRow(writer, agg_headers, null, widths);
+                    try writeTableSeparator(writer, widths);
+                }
+                try writeTableRow(writer, agg_values, null, widths);
+            } else {
+                if (!config.no_header) try writeRecord(writer, agg_headers, null, config.delimiter);
+                try writeRecord(writer, agg_values, null, config.delimiter);
+            }
         }
 
-        try writeSampleRows(prog_alloc, writer, header, col_indices, reservoir.items, config.table, !emit_input_header, config.delimiter);
         try bw.flush();
         return;
     }
 
     if (config.table) {
-        const num_output_cols = if (col_indices) |ci| ci.len else header.len;
-
-        const widths = try prog_alloc.alloc(usize, num_output_cols);
-        if (col_indices) |ci| {
-            for (ci, 0..) |c, i| {
-                widths[i] = if (c < header.len) displayWidth(header[c]) else 0;
+        var table_header_ready = false;
+        var header_emitted = false;
+        var widths_ready = false;
+        var buffered_rows = std.ArrayList([]const []const u8).init(prog_alloc);
+        defer {
+            for (buffered_rows.items) |row| {
+                for (row) |field| prog_alloc.free(field);
+                prog_alloc.free(row);
             }
-        } else {
-            for (header, 0..) |h, i| {
-                widths[i] = displayWidth(h);
-            }
+            buffered_rows.deinit();
         }
 
-        var buffered_rows = std.ArrayList([]const []const u8).init(prog_alloc);
+        var widths: []usize = &[_]usize{};
         var sample_bytes: usize = 0;
 
-        while (sample_bytes < table_sample_budget) {
-            if (config.head) |limit| {
-                if (buffered_rows.items.len >= limit) break;
-            }
-            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
-            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
-                std.process.exit(1);
-            };
+        for (input_paths) |input_path| {
+            var file: ?std.fs.File = null;
+            defer if (file) |f| f.close();
 
-            if (passesFilters(config.filters, result.fields)) {
-                const duped = try prog_alloc.alloc([]const u8, result.fields.len);
-                for (result.fields, 0..) |field, i| {
-                    duped[i] = try prog_alloc.dupe(u8, field);
-                    sample_bytes += field.len;
+            const source_name = if (std.mem.eql(u8, input_path, "-")) "stdin" else input_path;
+            if (std.mem.eql(u8, input_path, "-")) {
+                var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!table_header_ready) {
+                    if (config.selectors) |selectors| {
+                        const indices = try prog_alloc.alloc(usize, selectors.len);
+                        for (selectors, 0..) |sel, i| indices[i] = try resolveColumnIndex(schema.header.?, sel);
+                        col_indices = indices;
+                    }
+                    if (config.filters) |filters| {
+                        for (filters) |*f| f.col_index = try resolveColumnIndex(schema.header.?, f.field);
+                    }
+                    table_header_ready = true;
                 }
-                try buffered_rows.append(duped);
+                if (!widths_ready) {
+                    const num_output_cols = if (col_indices) |ci| ci.len else schema.header.?.len;
+                    widths = try prog_alloc.alloc(usize, num_output_cols);
+                    if (col_indices) |ci| {
+                        for (ci, 0..) |c, i| widths[i] = if (c < schema.header.?.len) displayWidth(schema.header.?[c]) else 0;
+                    } else {
+                        for (schema.header.?, 0..) |h, i| widths[i] = displayWidth(h);
+                    }
+                    widths_ready = true;
+                }
 
-                if (col_indices) |ci| {
-                    for (ci, 0..) |c, j| {
-                        if (c < duped.len) {
-                            const dw = displayWidth(duped[c]);
-                            if (dw > widths[j]) widths[j] = dw;
+                while (sample_bytes < table_sample_budget) {
+                    if (config.head) |limit| if (buffered_rows.items.len >= limit) break;
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (!passesFilters(config.filters, result.fields)) continue;
+
+                    const duped = try prog_alloc.alloc([]const u8, result.fields.len);
+                    for (result.fields, 0..) |field, i| {
+                        duped[i] = try prog_alloc.dupe(u8, field);
+                        sample_bytes += field.len;
+                    }
+                    try buffered_rows.append(duped);
+
+                    if (col_indices) |ci| {
+                        for (ci, 0..) |c, j| {
+                            if (c < duped.len) {
+                                const dw = displayWidth(duped[c]);
+                                if (dw > widths[j]) widths[j] = dw;
+                            }
+                        }
+                    } else {
+                        for (duped, 0..) |val, j| {
+                            if (j < widths.len) {
+                                const dw = displayWidth(val);
+                                if (dw > widths[j]) widths[j] = dw;
+                            }
                         }
                     }
-                } else {
-                    for (duped, 0..) |val, j| {
-                        if (j < widths.len) {
-                            const dw = displayWidth(val);
-                            if (dw > widths[j]) widths[j] = dw;
+                }
+
+                if (!header_emitted and emit_input_header) {
+                    try writeTableRow(writer, schema.header.?, col_indices, widths);
+                    try writeTableSeparator(writer, widths);
+                    header_emitted = true;
+                }
+            } else {
+                file = try std.fs.cwd().openFile(input_path, .{});
+                var br = std.io.bufferedReaderSize(read_buf_size, file.?.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!table_header_ready) {
+                    if (config.selectors) |selectors| {
+                        const indices = try prog_alloc.alloc(usize, selectors.len);
+                        for (selectors, 0..) |sel, i| indices[i] = try resolveColumnIndex(schema.header.?, sel);
+                        col_indices = indices;
+                    }
+                    if (config.filters) |filters| {
+                        for (filters) |*f| f.col_index = try resolveColumnIndex(schema.header.?, f.field);
+                    }
+                    table_header_ready = true;
+                }
+                if (!widths_ready) {
+                    const num_output_cols = if (col_indices) |ci| ci.len else schema.header.?.len;
+                    widths = try prog_alloc.alloc(usize, num_output_cols);
+                    if (col_indices) |ci| {
+                        for (ci, 0..) |c, i| widths[i] = if (c < schema.header.?.len) displayWidth(schema.header.?[c]) else 0;
+                    } else {
+                        for (schema.header.?, 0..) |h, i| widths[i] = displayWidth(h);
+                    }
+                    widths_ready = true;
+                }
+
+                while (sample_bytes < table_sample_budget) {
+                    if (config.head) |limit| if (buffered_rows.items.len >= limit) break;
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (!passesFilters(config.filters, result.fields)) continue;
+
+                    const duped = try prog_alloc.alloc([]const u8, result.fields.len);
+                    for (result.fields, 0..) |field, i| {
+                        duped[i] = try prog_alloc.dupe(u8, field);
+                        sample_bytes += field.len;
+                    }
+                    try buffered_rows.append(duped);
+
+                    if (col_indices) |ci| {
+                        for (ci, 0..) |c, j| {
+                            if (c < duped.len) {
+                                const dw = displayWidth(duped[c]);
+                                if (dw > widths[j]) widths[j] = dw;
+                            }
+                        }
+                    } else {
+                        for (duped, 0..) |val, j| {
+                            if (j < widths.len) {
+                                const dw = displayWidth(val);
+                                if (dw > widths[j]) widths[j] = dw;
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        if (emit_input_header) {
-            try writeTableRow(writer, header, col_indices, widths);
-            try writeTableSeparator(writer, widths);
+                if (!header_emitted and emit_input_header) {
+                    try writeTableRow(writer, schema.header.?, col_indices, widths);
+                    try writeTableSeparator(writer, widths);
+                    header_emitted = true;
+                }
+            }
         }
 
         for (buffered_rows.items) |row| {
@@ -2328,41 +2831,143 @@ pub fn main() !void {
             rows_written += 1;
         }
 
-        while (true) {
-            if (config.head) |limit| {
-                if (rows_written >= limit) break;
-            }
-            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
-            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
-                std.process.exit(1);
-            };
+        if (header_emitted and buffered_rows.items.len == 0 and !config.no_header) {
+            // Header already written.
+        } else if (!header_emitted and !config.no_header) {
+            try writeTableRow(writer, schema.header.?, col_indices, widths);
+            try writeTableSeparator(writer, widths);
+        }
 
-            if (passesFilters(config.filters, result.fields)) {
-                try writeTableRow(writer, result.fields, col_indices, widths);
-                rows_written += 1;
+        for (input_paths) |input_path| {
+            var file: ?std.fs.File = null;
+            defer if (file) |f| f.close();
+            const source_name = if (std.mem.eql(u8, input_path, "-")) "stdin" else input_path;
+            if (std.mem.eql(u8, input_path, "-")) {
+                var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                while (true) {
+                    if (config.head) |limit| if (rows_written >= limit) break;
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (passesFilters(config.filters, result.fields)) {
+                        try writeTableRow(writer, result.fields, col_indices, widths);
+                        rows_written += 1;
+                    }
+                }
+            } else {
+                file = try std.fs.cwd().openFile(input_path, .{});
+                var br = std.io.bufferedReaderSize(read_buf_size, file.?.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                while (true) {
+                    if (config.head) |limit| if (rows_written >= limit) break;
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (passesFilters(config.filters, result.fields)) {
+                        try writeTableRow(writer, result.fields, col_indices, widths);
+                        rows_written += 1;
+                    }
+                }
             }
         }
     } else {
-        if (emit_input_header) {
-            try writeRecord(writer, header, col_indices, config.delimiter);
-        }
+        var output_header_ready = false;
+        var output_header_emitted = false;
+        for (input_paths) |input_path| {
+            var file: ?std.fs.File = null;
+            defer if (file) |f| f.close();
+            const source_name = if (std.mem.eql(u8, input_path, "-")) "stdin" else input_path;
 
-        while (true) {
-            if (config.head) |limit| {
-                if (rows_written >= limit) break;
-            }
-            const line = readDataLine(&reader, &line_buf, &pending_first_data, &line_no) catch break orelse break;
-            const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
-                const stderr = std.io.getStdErr().writer();
-                try stderr.print("Error parsing CSV on line {d}: {s}\n", .{ line_no, parseRecordErrorMessage(err) });
-                std.process.exit(1);
-            };
-
-            if (passesFilters(config.filters, result.fields)) {
-                try writeRecordWithQuotedMask(writer, result.fields, result.quoted, col_indices, config.delimiter);
-                rows_written += 1;
+            if (std.mem.eql(u8, input_path, "-")) {
+                var br = std.io.bufferedReaderSize(read_buf_size, stdin.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!output_header_ready) {
+                    if (config.selectors) |selectors| {
+                        const indices = try prog_alloc.alloc(usize, selectors.len);
+                        for (selectors, 0..) |sel, i| indices[i] = try resolveColumnIndex(schema.header.?, sel);
+                        col_indices = indices;
+                    }
+                    if (config.filters) |filters| {
+                        for (filters) |*f| f.col_index = try resolveColumnIndex(schema.header.?, f.field);
+                    }
+                    output_header_ready = true;
+                }
+                if (!output_header_emitted and emit_input_header) {
+                    try writeRecord(writer, schema.header.?, col_indices, config.delimiter);
+                    output_header_emitted = true;
+                }
+                while (true) {
+                    if (config.head) |limit| if (rows_written >= limit) break;
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (passesFilters(config.filters, result.fields)) {
+                        try writeRecordWithQuotedMask(writer, result.fields, result.quoted, col_indices, config.delimiter);
+                        rows_written += 1;
+                    }
+                }
+            } else {
+                file = try std.fs.cwd().openFile(input_path, .{});
+                var br = std.io.bufferedReaderSize(read_buf_size, file.?.reader());
+                const reader = br.reader();
+                var pending_first_data: ?[]const u8 = null;
+                var line_no: usize = 0;
+                if (!try initInputSource(prog_alloc, reader, source_name, config, &schema, &line_buf, &field_buf, &quoted_buf, &quote_buf, &pending_first_data, &line_no)) continue;
+                if (!output_header_ready) {
+                    if (config.selectors) |selectors| {
+                        const indices = try prog_alloc.alloc(usize, selectors.len);
+                        for (selectors, 0..) |sel, i| indices[i] = try resolveColumnIndex(schema.header.?, sel);
+                        col_indices = indices;
+                    }
+                    if (config.filters) |filters| {
+                        for (filters) |*f| f.col_index = try resolveColumnIndex(schema.header.?, f.field);
+                    }
+                    output_header_ready = true;
+                }
+                if (!output_header_emitted and emit_input_header) {
+                    try writeRecord(writer, schema.header.?, col_indices, config.delimiter);
+                    output_header_emitted = true;
+                }
+                while (true) {
+                    if (config.head) |limit| if (rows_written >= limit) break;
+                    const line = readDataLine(reader, &line_buf, &pending_first_data, &line_no) catch |err| {
+                        try printReadError(source_name, line_no + 1, err);
+                        std.process.exit(1);
+                    } orelse break;
+                    const result = parseRecord(line, config.delimiter, &field_buf, &quoted_buf, &quote_buf) catch |err| {
+                        try printParseError(source_name, line_no, err);
+                        std.process.exit(1);
+                    };
+                    if (passesFilters(config.filters, result.fields)) {
+                        try writeRecordWithQuotedMask(writer, result.fields, result.quoted, col_indices, config.delimiter);
+                        rows_written += 1;
+                    }
+                }
             }
         }
     }
