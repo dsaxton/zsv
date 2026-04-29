@@ -1982,7 +1982,7 @@ test "worstTopIndex: returns index of smallest key among multiple rows" {
     try std.testing.expectEqual(@as(usize, 1), worstTopIndex(&rows));
 }
 
-pub fn main() !void {
+fn run() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -2973,4 +2973,11 @@ pub fn main() !void {
     }
 
     try bw.flush();
+}
+
+pub fn main() !void {
+    run() catch |err| switch (err) {
+        error.BrokenPipe => return,
+        else => return err,
+    };
 }

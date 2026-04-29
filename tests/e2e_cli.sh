@@ -22,6 +22,12 @@ trap cleanup EXIT
 printf 'name,score\nAlice,9\n' > "$tmpdir/part1.csv"
 printf 'name,score\nBob,8\nCara,10\n' > "$tmpdir/part2.csv"
 printf 'name,points\nMismatch,1\n' > "$tmpdir/bad.csv"
+{
+  printf 'id,value\n'
+  for i in $(seq 1 5000); do
+    printf '%s,%s\n' "$i" "$i"
+  done
+} > "$tmpdir/many.csv"
 
 run_case() {
   local name="$1"
@@ -176,6 +182,17 @@ if [[ "$actual_line_count" -eq 5 ]]; then
   echo "[PASS] sample: 100 rows from 4-row data returns 5 lines"
 else
   echo "[FAIL] sample: 100 rows from 4-row data returns 5 lines (got $actual_line_count)"
+  failures=$((failures + 1))
+fi
+
+actual="$($exe "$tmpdir/many.csv" | head -1)"
+expected='id,value'
+if [[ "$actual" == "$expected" ]]; then
+  echo "[PASS] pipe: downstream head closes cleanly"
+else
+  echo "[FAIL] pipe: downstream head closes cleanly"
+  echo "  expected: $expected"
+  echo "  got: $actual"
   failures=$((failures + 1))
 fi
 
