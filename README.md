@@ -1,0 +1,235 @@
+# zsv
+
+A fast, constant-memory CSV processor. Reads CSV from stdin or files, applies column selection and row filtering, and writes results to stdout.
+
+Written in Rust.
+
+## Build
+
+Requires [Rust](https://www.rust-lang.org/) 1.85 or newer.
+
+```
+cargo build --release
+```
+
+The binary is placed at `target/release/zsv`.
+
+Release builds are recommended for production use. The default debug build is useful for development but is slower.
+
+Run the test suite:
+
+```
+cargo test
+```
+
+Run only end-to-end CLI tests:
+
+```
+cargo build
+bash tests/e2e_cli.sh target/debug/zsv
+```
+
+## Usage
+
+```
+zsv [OPTIONS] [FILE...]
+```
+
+If no files are provided, input is read from stdin. If multiple files are provided, they are processed in order and stacked into one CSV. Use `-` to mix stdin with files.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `-s, --select FIELDS` | Comma-separated column names or 1-based indices |
+| `-f, --filter EXPR` | Filter expression (repeatable; multiple filters are ANDed) |
+| `-d, --delimiter DELIM` | Field delimiter. Defaults to comma; use `tab` or `\t` for TSV |
+| `-n, --head [N]` | Output first N data rows (after filtering). If N is omitted, defaults to 10 |
+| `--tail [N]` | Output last N data rows (after filtering) while keeping the header; defaults to 10 when omitted |
+| `--greatest FIELD` | Output rows with the largest values in FIELD (descending). Use with `-n` to set count (defaults to 10; max 10,000) |
+| `--least FIELD` | Output rows with the smallest values in FIELD (ascending). Use with `-n` to set count (defaults to 10; max 10,000) |
+| `--sample N` | Output a uniform random sample of N rows after filtering |
+| `--agg FUNC:FIELD` | Aggregate FIELD; FUNC: sum, min, max, count, mean. Repeatable; incompatible with `--greatest`/`--least` and `--head` |
+| `-t, --table` | Pretty-print output as an aligned table |
+| `--no-header` | Suppress header row in output |
+| `--input-no-header` | Treat the first input row as data instead of a header |
+| `--validate` | Validate CSV structure and column counts |
+| `-h, --help` | Print help message |
+
+Grouped aggregation is intentionally not supported so processing can retain the constant-memory model.
+
+### Examples
+
+Pass through a CSV file:
+
+```sh
+zsv data.csv
+```
+
+Stack multiple CSVs with the same header:
+
+```sh
+zsv part1.csv part2.csv part3.csv
+```
+
+Select specific columns by name:
+
+```sh
+zsv -s name,age < data.csv
+```
+
+Select by 1-based index:
+
+```sh
+zsv -s 1,3 < data.csv
+```
+
+Process TSV input:
+
+```sh
+zsv -d tab -s name,score < data.tsv
+```
+
+Process headerless input using 1-based column references:
+
+```sh
+zsv --input-no-header -s 1,3 -f "2>100" < data.csv
+```
+
+Mix stdin with files:
+
+```sh
+zsv part1.csv - part2.csv
+```
+
+Filter rows:
+
+```sh
+zsv -f "age>30" < data.csv
+```
+
+Head (first N matching rows):
+
+```sh
+zsv -n 100 -f "status=active" < data.csv
+```
+
+Tail (last N matching rows, header preserved):
+
+```sh
+zsv --tail 5 -s name,score < data.csv
+```
+
+Greatest N rows by a column (descending):
+
+```sh
+zsv --greatest salary -n 20 -s name,salary < employees.csv
+```
+
+Least N rows by a column (ascending):
+
+```sh
+zsv --least salary -n 5 -s name,salary < employees.csv
+```
+
+Greatest defaults to 10 rows when `-n` is present without a value:
+
+```sh
+zsv --greatest salary -n -s name,salary < employees.csv
+```
+
+Aggregate columns (sum, min, max, count, mean):
+
+```sh
+zsv --agg sum:amount --agg count:id < data.csv
+```
+
+Spaces around the operator are allowed:
+
+```sh
+zsv -f "Total Amount > 0.1" < data.csv
+```
+
+Combine select and filter:
+
+```sh
+zsv -s name,salary -f "department=Engineering" -f "salary>=100000" < employees.csv
+```
+
+Pretty-print as a table:
+
+```sh
+zsv -t < data.csv
+```
+
+Table with select and filter:
+
+```sh
+zsv -t -s name,salary -f "salary>=100000" < employees.csv
+```
+
+Column widths are estimated by buffering up to 1 MB of row data. Later values that exceed the estimated width are not truncated but may cause misalignment. Multi-byte UTF-8 characters are measured by display column (codepoint count), not byte length, so non-ASCII text aligns correctly.
+
+Glob filter (prefix match):
+
+```sh
+zsv -f "city~New*" < data.csv
+```
+
+Glob filter (contains):
+
+```sh
+zsv -f "city~*York*" < data.csv
+```
+
+Suppress the header row:
+
+```sh
+zsv --no-header -s name < data.csv
+```
+
+Page through results with `less`:
+
+```sh
+zsv -t < data.csv | less -S
+```
+
+The `-S` flag disables line wrapping, which keeps table columns aligned.
+
+Pipe with other tools:
+
+```sh
+curl -s https://example.com/data.csv | zsv -f "status=active" -s id,name | wc -l
+```
+
+### Filter operators
+
+| Operator | Meaning |
+|---|---|
+| `=` | Equal |
+| `!=` | Not equal |
+| `<` | Less than |
+| `>` | Greater than |
+| `<=` | Less than or equal |
+| `>=` | Greater than or equal |
+| `~` | Glob match (`*` matches any sequence of characters) |
+
+The `~` operator is always string-based and supports `*` wildcards: `name~Alice` (exact), `city~New*` (prefix), `city~*York` (suffix), `city~*ew*` (contains). All other filters attempt numeric comparison first. If both sides parse as numbers, the comparison is numeric; otherwise it falls back to lexicographic string comparison.
+
+Column names with spaces work in filter expressions. Whitespace around the operator is trimmed, so `"Total Amount > 100"` correctly references the column `Total Amount`.
+
+## Limitations
+
+- Inputs must have matching headers when multiple files are provided.
+- Maximum line length is 1 MB. Lines exceeding this limit produce an error.
+- Maximum fields per row is 4096. Rows exceeding this limit produce an error.
+- Newlines within quoted fields are not supported (the parser splits on `\n` before parsing fields).
+- Empty lines in the input are silently skipped.
+- Filter values cannot contain the operator characters (`=`, `<`, `>`, `!`, `~`) since the parser splits on the first operator it finds in the expression.
+- In transform modes (`--select`, `--filter`, or `--table`), malformed quoted fields (e.g. unterminated quotes or non-delimiter content after a closing quote) produce an error.
+- Grouped aggregation is not supported; ungrouped `--agg` remains constant-memory.
+
+## Error handling
+
+- CSV parse errors are reported to stderr with the line number and a short reason, and the process exits with a non-zero status.
+- The no-transform pass-through path (`zsv < file.csv` with no `--select`, `--filter`, or `--table`) streams lines without CSV field parsing, so malformed CSV rows are passed through as-is in that mode.
