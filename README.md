@@ -1,8 +1,6 @@
 # zsv
 
-A fast, constant-memory CSV processor. Reads CSV from stdin or files, applies column selection and row filtering, and writes results to stdout.
-
-Written in Rust.
+A fast CSV processor. Reads CSV from stdin or files, applies column selection, filtering, and aggregation, and writes results to stdout. Most operations are constant-memory; grouped aggregation uses memory proportional to the number of distinct group values.
 
 ## Build
 
@@ -49,14 +47,13 @@ If no files are provided, input is read from stdin. If multiple files are provid
 | `--greatest FIELD` | Output rows with the largest values in FIELD (descending). Use with `-n` to set count (defaults to 10; max 10,000) |
 | `--least FIELD` | Output rows with the smallest values in FIELD (ascending). Use with `-n` to set count (defaults to 10; max 10,000) |
 | `--sample N` | Output a uniform random sample of N rows after filtering |
-| `--agg FUNC:FIELD` | Aggregate FIELD; FUNC: sum, min, max, count, mean. Repeatable; incompatible with `--greatest`/`--least` and `--head` |
+| `--agg FUNC:FIELD` | Aggregate FIELD; FUNC: sum, min, max, count, mean. Use `--agg count` (no field) to count all rows. Repeatable; incompatible with `--greatest`/`--least` and `--head` |
+| `--group-by FIELD` | Group aggregations by FIELD (requires `--agg`). Memory grows with number of distinct group values |
 | `-t, --table` | Pretty-print output as an aligned table |
 | `--no-header` | Suppress header row in output |
 | `--input-no-header` | Treat the first input row as data instead of a header |
 | `--validate` | Validate CSV structure and column counts |
 | `-h, --help` | Print help message |
-
-Grouped aggregation is intentionally not supported so processing can retain the constant-memory model.
 
 ### Examples
 
@@ -144,6 +141,18 @@ Aggregate columns (sum, min, max, count, mean):
 zsv --agg sum:amount --agg count:id < data.csv
 ```
 
+Count rows per group:
+
+```sh
+zsv --group-by dept --agg count < employees.csv
+```
+
+Grouped sum and count together:
+
+```sh
+zsv --group-by dept --agg count --agg sum:salary < employees.csv
+```
+
 Spaces around the operator are allowed:
 
 ```sh
@@ -227,7 +236,7 @@ Column names with spaces work in filter expressions. Whitespace around the opera
 - Empty lines in the input are silently skipped.
 - Filter values cannot contain the operator characters (`=`, `<`, `>`, `!`, `~`) since the parser splits on the first operator it finds in the expression.
 - In transform modes (`--select`, `--filter`, or `--table`), malformed quoted fields (e.g. unterminated quotes or non-delimiter content after a closing quote) produce an error.
-- Grouped aggregation is not supported; ungrouped `--agg` remains constant-memory.
+- Grouped aggregation (`--group-by`) holds one accumulator per distinct group value in memory. For high-cardinality columns (UUIDs, emails), memory use can be large.
 
 ## Error handling
 

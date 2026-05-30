@@ -144,11 +144,33 @@ else
   failures=$((failures + 1))
 fi
 
-if printf '%s' "$CSV_INPUT" | "$exe" --group-by dept --agg count:name >/dev/null 2>&1; then
-  echo "[FAIL] group-by: removed option should fail"
+actual="$(printf '%s' "$CSV_INPUT" | "$exe" --group-by dept --agg count)"
+expected="$(printf 'dept,count\nEng,2\nSales,1\nOps,1')"
+if [[ "$actual" == "$expected" ]]; then
+  echo "[PASS] group-by: count per group"
+else
+  echo "[FAIL] group-by: count per group"
+  echo "  expected: $expected"
+  echo "  actual:   $actual"
+  failures=$((failures + 1))
+fi
+
+actual="$(printf '%s' "$CSV_INPUT" | "$exe" --group-by dept --agg sum:score)"
+expected="$(printf 'dept,sum(score)\nEng,19\nSales,8\nOps,7')"
+if [[ "$actual" == "$expected" ]]; then
+  echo "[PASS] group-by: sum per group"
+else
+  echo "[FAIL] group-by: sum per group"
+  echo "  expected: $expected"
+  echo "  actual:   $actual"
+  failures=$((failures + 1))
+fi
+
+if printf '%s' "$CSV_INPUT" | "$exe" --group-by dept >/dev/null 2>&1; then
+  echo "[FAIL] group-by: without --agg should fail"
   failures=$((failures + 1))
 else
-  echo "[PASS] group-by: removed option should fail"
+  echo "[PASS] group-by: without --agg should fail"
 fi
 
 # Test --sample: produces exactly 3 lines (1 header + 2 data rows)

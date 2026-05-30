@@ -84,6 +84,18 @@ impl Agg {
             tainted: false,
         }
     }
+
+    fn count_all(&self) -> bool {
+        self.func == AggFunc::Count && self.field.is_empty()
+    }
+
+    fn header_name(&self) -> Vec<u8> {
+        if self.count_all() {
+            b"count".to_vec()
+        } else {
+            format!("{}({})", self.func.name(), self.field).into_bytes()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +145,7 @@ struct Config {
     input_no_header: bool,
     table: bool,
     validate: bool,
+    group_by: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,7 +284,7 @@ enum ParsedArgs {
 }
 
 fn usage() -> &'static str {
-    "Usage: zsv [OPTIONS]\n       zsv [OPTIONS] [FILE...]\n\nReads CSV from stdin and writes to stdout.\nIf FILEs are provided, they are processed in order and stacked as one CSV.\nUse - to read from stdin in a file list.\n\nOptions:\n  -s, --select FIELDS   Comma-separated column names or 1-based indices\n  -f, --filter EXPR     Filter expression: field op value\n                        Operators: =, !=, <, >, <=, >=, ~ (glob)\n                        Repeatable (multiple filters = AND)\n  -d, --delimiter DELIM Field delimiter (default comma; supports tab or \\t)\n  -n, --head [N]        Output first N data rows (after filtering; default 10 when omitted)\n      --tail [N]        Output last N data rows (after filtering; preserves header; default 10 when omitted)\n      --greatest FIELD  Output rows with the largest values in FIELD; use -n for count (default 10; max 10000)\n      --least FIELD     Output rows with the smallest values in FIELD; use -n for count (default 10; max 10000)\n      --sample N        Output uniform random sample of N rows (after filtering)\n      --agg FUNC:FIELD  Aggregate FIELD; FUNC: sum, min, max, count, mean\n                        Repeatable; incompatible with --greatest/--least and --head\n  -t, --table           Pretty-print output as an aligned table\n      --no-header       Suppress header row in output\n      --input-no-header Treat the first input row as data\n      --validate        Validate CSV structure (parse + column count)\n  -h, --help            Print this help message\n"
+    "Usage: zsv [OPTIONS]\n       zsv [OPTIONS] [FILE...]\n\nReads CSV from stdin and writes to stdout.\nIf FILEs are provided, they are processed in order and stacked as one CSV.\nUse - to read from stdin in a file list.\n\nOptions:\n  -s, --select FIELDS   Comma-separated column names or 1-based indices\n  -f, --filter EXPR     Filter expression: field op value\n                        Operators: =, !=, <, >, <=, >=, ~ (glob)\n                        Repeatable (multiple filters = AND)\n  -d, --delimiter DELIM Field delimiter (default comma; supports tab or \\t)\n  -n, --head [N]        Output first N data rows (after filtering; default 10 when omitted)\n      --tail [N]        Output last N data rows (after filtering; preserves header; default 10 when omitted)\n      --greatest FIELD  Output rows with the largest values in FIELD; use -n for count (default 10; max 10000)\n      --least FIELD     Output rows with the smallest values in FIELD; use -n for count (default 10; max 10000)\n      --sample N        Output uniform random sample of N rows (after filtering)\n      --agg FUNC:FIELD  Aggregate FIELD; FUNC: sum, min, max, count, mean\n                        Use --agg count (no field) to count all rows\n                        Repeatable; incompatible with --greatest/--least and --head\n      --group-by FIELD  Group aggregations by FIELD (requires --agg)\n                        Memory grows with number of distinct group values\n  -t, --table           Pretty-print output as an aligned table\n      --no-header       Suppress header row in output\n      --input-no-header Treat the first input row as data\n      --validate        Validate CSV structure (parse + column count)\n  -h, --help            Print this help message\n"
 }
 
 fn parse_delimiter(value: &str) -> Option<u8> {
@@ -365,6 +378,12 @@ fn parse_args_list(args: &[String]) -> CliResult<ParsedArgs> {
                 CliError::Message(format!("Error: invalid --agg expression: {value}"))
             })?;
             config.aggs.push(agg);
+        } else if !positional_mode && arg == "--group-by" {
+            i += 1;
+            let value = args.get(i).ok_or_else(|| {
+                CliError::Message("Error: --group-by requires a field name".to_string())
+            })?;
+            config.group_by = Some(value.clone());
         } else if !positional_mode && arg == "--greatest" {
             if rank_field.is_some() {
                 return Err(CliError::Message(
@@ -431,6 +450,12 @@ fn parse_args_list(args: &[String]) -> CliResult<ParsedArgs> {
             field,
             direction: rank_direction.expect("rank direction set with field"),
         });
+    }
+
+    if config.group_by.is_some() && config.aggs.is_empty() {
+        return Err(CliError::Message(
+            "Error: --group-by requires at least one --agg".to_string(),
+        ));
     }
 
     if !config.aggs.is_empty() {
@@ -540,6 +565,9 @@ fn parse_filter(expr: &str) -> Option<Filter> {
 }
 
 fn parse_agg(expr: &str) -> Option<Agg> {
+    if expr == "count" {
+        return Some(Agg::new(AggFunc::Count, ""));
+    }
     let (func_str, field) = expr.split_once(':')?;
     if func_str.is_empty() || field.is_empty() {
         return None;
@@ -859,7 +887,11 @@ fn execute<R: Read, W: Write, E: Write>(
     }
 
     if !config.aggs.is_empty() {
-        agg_mode(&input_paths, &mut config, stdin, &mut writer, stderr)?;
+        if config.group_by.is_some() {
+            grouped_agg_mode(&input_paths, &mut config, stdin, &mut writer, stderr)?;
+        } else {
+            agg_mode(&input_paths, &mut config, stdin, &mut writer, stderr)?;
+        }
         writer.flush()?;
         return Ok(());
     }
@@ -1261,6 +1293,126 @@ fn rank_mode<R: Read, W: Write>(
     )
 }
 
+fn grouped_agg_mode<R: Read, W: Write, E: Write>(
+    input_paths: &[String],
+    config: &mut Config,
+    stdin: &mut R,
+    writer: &mut W,
+    stderr: &mut E,
+) -> CliResult<()> {
+    use std::collections::HashMap;
+
+    let mut schema = InputSchema::default();
+    let mut ready = false;
+    let mut group_col_index: usize = 0;
+    let mut fresh_aggs: Vec<Agg> = Vec::new();
+    let mut groups: HashMap<Vec<u8>, Vec<Agg>> = HashMap::new();
+    let mut order: Vec<Vec<u8>> = Vec::new();
+
+    for input_path in input_paths {
+        with_source(input_path, stdin, |reader, source_name| {
+            let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
+            let Some(mut state) =
+                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            else {
+                return Ok(());
+            };
+            if !ready {
+                group_col_index = resolve_column_index(
+                    schema.header.as_ref().unwrap(),
+                    config.group_by.as_ref().unwrap(),
+                )?;
+                for agg in &mut config.aggs {
+                    if !agg.count_all() {
+                        agg.col_index = Some(resolve_column_index(
+                            schema.header.as_ref().unwrap(),
+                            &agg.field,
+                        )?);
+                    }
+                }
+                fresh_aggs = config.aggs.clone();
+                ready = true;
+            }
+            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+                .map_err(|err| read_error(source_name, state.line_no + 1, err))?
+            {
+                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
+                if !passes_filters(&config.filters, &row) {
+                    continue;
+                }
+                let key = row
+                    .get(group_col_index)
+                    .map(|f| f.value.clone())
+                    .unwrap_or_default();
+                let aggs = match groups.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        order.push(e.key().clone());
+                        e.insert(fresh_aggs.clone())
+                    }
+                };
+                for agg in aggs.iter_mut() {
+                    if agg.count_all() {
+                        agg.n += 1;
+                    } else if let Some(col) = agg.col_index {
+                        if let Some(field) = row.get(col) {
+                            update_agg(agg, &field.value);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    let group_col_name = schema
+        .header
+        .as_ref()
+        .and_then(|h| h.get(group_col_index))
+        .cloned()
+        .unwrap_or_default();
+
+    let mut headers: Vec<Vec<u8>> = vec![group_col_name];
+    headers.extend(config.aggs.iter().map(|agg| agg.header_name()));
+
+    let mut rows: Vec<Vec<Vec<u8>>> = Vec::with_capacity(order.len());
+    for key in &order {
+        let aggs = &groups[key];
+        let mut values: Vec<Vec<u8>> = vec![key.clone()];
+        for agg in aggs {
+            values.push(format_agg_value(agg, stderr)?);
+        }
+        rows.push(values);
+    }
+
+    if config.table {
+        let mut widths: Vec<usize> = headers.iter().map(|h| display_width(h)).collect();
+        for row in &rows {
+            for (i, v) in row.iter().enumerate() {
+                if i < widths.len() {
+                    widths[i] = widths[i].max(display_width(v));
+                }
+            }
+        }
+        if !config.no_header {
+            write_table_row(writer, &headers, None, &widths)?;
+            write_table_separator(writer, &widths)?;
+        }
+        for row in &rows {
+            write_table_row(writer, row, None, &widths)?;
+        }
+    } else {
+        if !config.no_header {
+            write_record(writer, &headers, None, config.delimiter)?;
+        }
+        for row in &rows {
+            write_record(writer, row, None, config.delimiter)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn agg_mode<R: Read, W: Write, E: Write>(
     input_paths: &[String],
     config: &mut Config,
@@ -1280,10 +1432,12 @@ fn agg_mode<R: Read, W: Write, E: Write>(
             };
             if !ready {
                 for agg in &mut config.aggs {
-                    agg.col_index = Some(resolve_column_index(
-                        schema.header.as_ref().unwrap(),
-                        &agg.field,
-                    )?);
+                    if !agg.count_all() {
+                        agg.col_index = Some(resolve_column_index(
+                            schema.header.as_ref().unwrap(),
+                            &agg.field,
+                        )?);
+                    }
                 }
                 for filter in &mut config.filters {
                     filter.col_index = Some(resolve_column_index(
@@ -1301,7 +1455,9 @@ fn agg_mode<R: Read, W: Write, E: Write>(
                     continue;
                 }
                 for agg in &mut config.aggs {
-                    if let Some(col) = agg.col_index {
+                    if agg.count_all() {
+                        agg.n += 1;
+                    } else if let Some(col) = agg.col_index {
                         if let Some(field) = row.get(col) {
                             update_agg(agg, &field.value);
                         }
@@ -1312,26 +1468,10 @@ fn agg_mode<R: Read, W: Write, E: Write>(
         })?;
     }
 
-    let headers: Vec<Vec<u8>> = config
-        .aggs
-        .iter()
-        .map(|agg| format!("{}({})", agg.func.name(), agg.field).into_bytes())
-        .collect();
+    let headers: Vec<Vec<u8>> = config.aggs.iter().map(|agg| agg.header_name()).collect();
     let mut values = Vec::with_capacity(config.aggs.len());
     for agg in &config.aggs {
-        if agg.func == AggFunc::Count {
-            values.push(agg.n.to_string().into_bytes());
-        } else if agg.tainted {
-            writeln!(
-                stderr,
-                "Warning: {}({}): non-numeric values encountered",
-                agg.func.name(),
-                agg.field
-            )?;
-            values.push(Vec::new());
-        } else {
-            values.push(format_number(agg_result(agg)).into_bytes());
-        }
+        values.push(format_agg_value(agg, stderr)?);
     }
     if config.table {
         let widths: Vec<usize> = headers
@@ -1648,6 +1788,22 @@ fn format_number(n: f64) -> String {
     n.to_string()
 }
 
+fn format_agg_value<E: Write>(agg: &Agg, stderr: &mut E) -> CliResult<Vec<u8>> {
+    if agg.func == AggFunc::Count {
+        return Ok(agg.n.to_string().into_bytes());
+    }
+    if agg.tainted {
+        writeln!(
+            stderr,
+            "Warning: {}({}): non-numeric values encountered",
+            agg.func.name(),
+            agg.field
+        )?;
+        return Ok(Vec::new());
+    }
+    Ok(format_number(agg_result(agg)).into_bytes())
+}
+
 fn display_width(bytes: &[u8]) -> usize {
     let mut width = 0;
     let mut i = 0;
@@ -1904,8 +2060,73 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_group_by_removed() {
+    fn parse_args_group_by() {
+        match parse_args_list(&args(&["zsv", "--group-by", "dept", "--agg", "count"])).unwrap() {
+            ParsedArgs::Config(cfg) => {
+                assert_eq!(cfg.group_by, Some("dept".to_string()));
+                assert_eq!(cfg.aggs.len(), 1);
+                assert!(cfg.aggs[0].count_all());
+            }
+            ParsedArgs::Help => panic!(),
+        }
         assert!(parse_args_list(&args(&["zsv", "--group-by", "dept"])).is_err());
+    }
+
+    #[test]
+    fn run_grouped_agg_count_all() {
+        let input = b"dept,name\neng,alice\neng,bob\nops,carol\n";
+        let mut stdin = &input[..];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run(
+            &args(&["zsv", "--group-by", "dept", "--agg", "count"]),
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "dept,count\neng,2\nops,1\n"
+        );
+    }
+
+    #[test]
+    fn run_grouped_agg_sum() {
+        let input = b"dept,salary\neng,100\neng,200\nops,50\n";
+        let mut stdin = &input[..];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run(
+            &args(&["zsv", "--group-by", "dept", "--agg", "sum:salary"]),
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "dept,sum(salary)\neng,300\nops,50\n"
+        );
+    }
+
+    #[test]
+    fn run_grouped_agg_multiple() {
+        let input = b"dept,salary\neng,100\neng,200\nops,50\n";
+        let mut stdin = &input[..];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run(
+            &args(&["zsv", "--group-by", "dept", "--agg", "count", "--agg", "mean:salary"]),
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "dept,count,mean(salary)\neng,2,150\nops,1,50\n"
+        );
     }
 
     #[test]
