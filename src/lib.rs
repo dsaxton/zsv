@@ -1825,14 +1825,10 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     true
 }
 
-fn compare_rank_keys(a_num: Option<f64>, a: &[u8], b_num: Option<f64>, b: &[u8]) -> Ordering {
-    if let (Some(a), Some(b)) = (a_num, b_num) {
-        a.partial_cmp(&b).unwrap_or(Ordering::Equal)
-    } else {
-        a.cmp(b)
-    }
-}
-
+/// A total order over rank keys; greater means ranked higher. Keys that parse as
+/// numbers rank ahead of non-numeric keys in both directions. Within each class,
+/// numbers compare with `f64::total_cmp` and text compares as bytes, and `direction`
+/// picks which end of that class ranks higher.
 fn compare_rank_keys_for_direction(
     direction: RankDirection,
     a_num: Option<f64>,
@@ -1840,10 +1836,15 @@ fn compare_rank_keys_for_direction(
     b_num: Option<f64>,
     b: &[u8],
 ) -> Ordering {
-    let base = compare_rank_keys(a_num, a, b_num, b);
-    match direction {
-        RankDirection::Greatest => base,
-        RankDirection::Least => base.reverse(),
+    let within_class = |ord: Ordering| match direction {
+        RankDirection::Greatest => ord,
+        RankDirection::Least => ord.reverse(),
+    };
+    match (a_num, b_num) {
+        (Some(x), Some(y)) => within_class(x.total_cmp(&y)),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => within_class(a.cmp(b)),
     }
 }
 
@@ -2320,15 +2321,25 @@ mod tests {
 
     #[test]
     fn rank_helpers() {
+        use RankDirection::{Greatest, Least};
+        let cmp = compare_rank_keys_for_direction;
         assert_eq!(
-            compare_rank_keys(Some(5.0), b"5", Some(3.0), b"3"),
+            cmp(Greatest, Some(5.0), b"5", Some(3.0), b"3"),
             Ordering::Greater
         );
-        assert_eq!(compare_rank_keys(None, b"b", None, b"a"), Ordering::Greater);
+        assert_eq!(cmp(Least, Some(5.0), b"5", Some(3.0), b"3"), Ordering::Less);
+        assert_eq!(cmp(Greatest, None, b"b", None, b"a"), Ordering::Greater);
+        assert_eq!(cmp(Least, None, b"b", None, b"a"), Ordering::Less);
+        // A numeric key outranks a non-numeric one in both directions.
         assert_eq!(
-            compare_rank_keys(Some(10.0), b"10", None, b"9"),
-            Ordering::Less
+            cmp(Greatest, Some(10.0), b"10", None, b"9x"),
+            Ordering::Greater
         );
+        assert_eq!(
+            cmp(Least, Some(10.0), b"10", None, b"9x"),
+            Ordering::Greater
+        );
+        assert_eq!(cmp(Least, None, b"9x", Some(10.0), b"10"), Ordering::Less);
     }
 
     #[test]
@@ -2525,6 +2536,44 @@ mod tests {
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
             "Warning: sum(salary): non-numeric values encountered\n"
+        );
+    }
+
+    #[test]
+    fn run_rank_mixed_numeric_and_text_keys() {
+        let input = b"name,score\na,1x\nb,2\nc,10\nd,3\ne,5\n";
+        assert_eq!(
+            run_ok(
+                &["zsv", "--greatest", "score", "-n", "4", "-s", "name"],
+                input
+            ),
+            "name\nc\ne\nd\nb\n"
+        );
+        assert_eq!(
+            run_ok(&["zsv", "--least", "score", "-n", "4", "-s", "name"], input),
+            "name\nb\nd\ne\nc\n"
+        );
+        assert_eq!(
+            run_ok(&["zsv", "--least", "score", "-n", "5", "-s", "name"], input),
+            "name\nb\nd\ne\nc\na\n"
+        );
+        let reversed = b"name,score\ne,5\nd,3\nc,10\nb,2\na,1x\n";
+        assert_eq!(
+            run_ok(
+                &["zsv", "--greatest", "score", "-n", "4", "-s", "name"],
+                reversed
+            ),
+            "name\nc\ne\nd\nb\n"
+        );
+    }
+
+    #[test]
+    fn run_rank_nan_key_does_not_panic() {
+        let input = b"name,v\na,NaN\nb,1\nc,2\n";
+        // total_cmp puts positive NaN above every finite value.
+        assert_eq!(
+            run_ok(&["zsv", "--greatest", "v", "-n", "3", "-s", "name"], input),
+            "name\na\nc\nb\n"
         );
     }
 }

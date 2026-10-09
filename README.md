@@ -135,6 +135,8 @@ Greatest defaults to 10 rows when `-n` is present without a value:
 zsv --greatest salary -n -s name,salary < employees.csv
 ```
 
+Values that parse as numbers are compared numerically and always rank ahead of non-numeric values, which are compared as strings and come after the numbers in both directions.
+
 Aggregate columns (sum, min, max, count, mean):
 
 ```sh
