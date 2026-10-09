@@ -1,4 +1,5 @@
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -233,12 +234,43 @@ impl ParseRecordError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct RankedRow {
     fields: Vec<Vec<u8>>,
     key: Vec<u8>,
     key_num: Option<f64>,
+    seq: usize,
+    direction: RankDirection,
 }
+
+/// Greater means ranked higher. Equal keys rank by input order (earlier first),
+/// so the kept rows match a stable sort of all rows truncated to N.
+impl Ord for RankedRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_rank_keys_for_direction(
+            self.direction,
+            self.key_num,
+            &self.key,
+            other.key_num,
+            &other.key,
+        )
+        .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for RankedRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedRow {}
 
 #[derive(Debug)]
 struct SampleRow {
@@ -1286,7 +1318,9 @@ fn rank_mode<R: Read, W: Write>(
     let mut col_indices: Option<Vec<usize>> = None;
     let mut rank_col_index: Option<usize> = None;
     let mut ready = false;
-    let mut ranked_rows: Vec<RankedRow> = Vec::new();
+    // Min-heap of the best `limit` rows seen so far; the root is the current worst.
+    let mut heap: BinaryHeap<Reverse<RankedRow>> = BinaryHeap::with_capacity(limit);
+    let mut seq = 0;
 
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
@@ -1325,41 +1359,40 @@ fn rank_mode<R: Read, W: Write>(
                 let rank_idx = rank_col_index.unwrap();
                 let key = record.get(rank_idx).unwrap_or(b"");
                 let key_num = parse_f64_bytes(key);
-                if ranked_rows.len() < limit {
-                    let fields = record.to_vecs();
-                    let duped_key = fields.get(rank_idx).cloned().unwrap_or_default();
-                    ranked_rows.push(RankedRow {
-                        fields,
-                        key: duped_key,
+                if heap.len() < limit {
+                    heap.push(Reverse(RankedRow {
+                        fields: record.to_vecs(),
+                        key: key.to_vec(),
                         key_num,
-                    });
+                        seq,
+                        direction: rank_cfg.direction,
+                    }));
                 } else {
-                    let wi = worst_rank_index(rank_cfg.direction, &ranked_rows);
-                    let worst = &ranked_rows[wi];
+                    let mut worst = heap.peek_mut().expect("heap holds limit > 0 rows");
+                    // A later row with an equal key ranks lower, so it must be strictly better.
                     if compare_rank_keys_for_direction(
                         rank_cfg.direction,
                         key_num,
                         key,
-                        worst.key_num,
-                        &worst.key,
+                        worst.0.key_num,
+                        &worst.0.key,
                     ) == Ordering::Greater
                     {
-                        let fields = record.to_vecs();
-                        let duped_key = fields.get(rank_idx).cloned().unwrap_or_default();
-                        ranked_rows[wi] = RankedRow {
-                            fields,
-                            key: duped_key,
-                            key_num,
-                        };
+                        let row = &mut worst.0;
+                        record.copy_into(&mut row.fields);
+                        row.key.clear();
+                        row.key.extend_from_slice(key);
+                        row.key_num = key_num;
+                        row.seq = seq;
                     }
                 }
+                seq += 1;
             }
             Ok(())
         })?;
     }
-    ranked_rows.sort_by(|a, b| {
-        compare_rank_keys_for_direction(rank_cfg.direction, b.key_num, &b.key, a.key_num, &a.key)
-    });
+    let mut ranked_rows: Vec<RankedRow> = heap.into_iter().map(|Reverse(row)| row).collect();
+    ranked_rows.sort_unstable_by(|a, b| b.cmp(a));
     let rows: Vec<&[Vec<u8>]> = ranked_rows
         .iter()
         .map(|row| row.fields.as_slice())
@@ -1810,23 +1843,6 @@ fn compare_rank_keys_for_direction(
         RankDirection::Greatest => base,
         RankDirection::Least => base.reverse(),
     }
-}
-
-fn worst_rank_index(direction: RankDirection, rows: &[RankedRow]) -> usize {
-    let mut worst = 0;
-    for i in 1..rows.len() {
-        if compare_rank_keys_for_direction(
-            direction,
-            rows[i].key_num,
-            &rows[i].key,
-            rows[worst].key_num,
-            &rows[worst].key,
-        ) == Ordering::Less
-        {
-            worst = i;
-        }
-    }
-    worst
 }
 
 fn parse_f64_bytes(bytes: &[u8]) -> Option<f64> {
@@ -2296,25 +2312,6 @@ mod tests {
             compare_rank_keys(Some(10.0), b"10", None, b"9"),
             Ordering::Less
         );
-        let rows = vec![
-            RankedRow {
-                fields: vec![],
-                key: b"10".to_vec(),
-                key_num: Some(10.0),
-            },
-            RankedRow {
-                fields: vec![],
-                key: b"3".to_vec(),
-                key_num: Some(3.0),
-            },
-            RankedRow {
-                fields: vec![],
-                key: b"7".to_vec(),
-                key_num: Some(7.0),
-            },
-        ];
-        assert_eq!(worst_rank_index(RankDirection::Greatest, &rows), 1);
-        assert_eq!(worst_rank_index(RankDirection::Least, &rows), 0);
     }
 
     #[test]
@@ -2426,5 +2423,60 @@ mod tests {
         let mut out = Vec::new();
         write_field(&mut out, b"\"a\"\"b\"", DEFAULT_DELIMITER).unwrap();
         assert_eq!(out, b"\"\"\"a\"\"\"\"b\"\"\"");
+    }
+
+    fn run_ok(argv: &[&str], input: &[u8]) -> String {
+        let mut stdin = input;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run(&args(argv), &mut stdin, &mut stdout, &mut stderr).unwrap();
+        String::from_utf8(stdout).unwrap()
+    }
+
+    #[test]
+    fn run_rank_ties_keep_earliest_rows() {
+        let input = b"name,score\nA,5\nB,5\nC,6\nD,5\n";
+        assert_eq!(
+            run_ok(
+                &["zsv", "--greatest", "score", "-n", "2", "-s", "name"],
+                input
+            ),
+            "name\nC\nA\n"
+        );
+        assert_eq!(
+            run_ok(&["zsv", "--least", "score", "-n", "2", "-s", "name"], input),
+            "name\nA\nB\n"
+        );
+    }
+
+    #[test]
+    fn run_rank_many_rows() {
+        let mut input = b"id,v\n".to_vec();
+        for i in 0..1000u32 {
+            input.extend_from_slice(format!("{i},{}\n", (i * 37) % 1000).as_bytes());
+        }
+        assert_eq!(
+            run_ok(
+                &[
+                    "zsv",
+                    "--greatest",
+                    "v",
+                    "-n",
+                    "5",
+                    "-s",
+                    "v",
+                    "--no-header"
+                ],
+                &input
+            ),
+            "999\n998\n997\n996\n995\n"
+        );
+        assert_eq!(
+            run_ok(
+                &["zsv", "--least", "v", "-n", "3", "-s", "v", "--no-header"],
+                &input
+            ),
+            "0\n1\n2\n"
+        );
     }
 }
