@@ -67,6 +67,10 @@ struct Agg {
     func: AggFunc,
     field: String,
     col_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AggState {
     total: f64,
     extreme: f64,
     n: usize,
@@ -79,10 +83,6 @@ impl Agg {
             func,
             field: field.to_string(),
             col_index: None,
-            total: 0.0,
-            extreme: 0.0,
-            n: 0,
-            tainted: false,
         }
     }
 
@@ -1420,9 +1420,11 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
     let mut schema = InputSchema::default();
     let mut ready = false;
     let mut group_col_index: usize = 0;
-    let mut fresh_aggs: Vec<Agg> = Vec::new();
-    let mut groups: HashMap<Vec<u8>, Vec<Agg>> = HashMap::new();
-    let mut order: Vec<Vec<u8>> = Vec::new();
+    let n_aggs = config.aggs.len();
+    // Group key -> group number in first-seen order. Accumulators for group g are
+    // states[g * n_aggs..(g + 1) * n_aggs]. Each key is stored once.
+    let mut groups: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut states: Vec<AggState> = Vec::new();
 
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
@@ -1452,7 +1454,6 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
                         )?);
                     }
                 }
-                fresh_aggs = config.aggs.clone();
                 ready = true;
             }
             while read_data_line(reader, &mut line_buf, &mut state)
@@ -1462,23 +1463,23 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
                 if !passes_filters(&config.filters, &record) {
                     continue;
                 }
-                let key = record
-                    .get(group_col_index)
-                    .map(<[u8]>::to_vec)
-                    .unwrap_or_default();
-                let aggs = match groups.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        order.push(e.key().clone());
-                        e.insert(fresh_aggs.clone())
+                let key = record.get(group_col_index).unwrap_or(b"");
+                let group = match groups.get(key) {
+                    Some(&group) => group,
+                    None => {
+                        let group = groups.len();
+                        groups.insert(key.to_vec(), group);
+                        states.resize(states.len() + n_aggs, AggState::default());
+                        group
                     }
                 };
-                for agg in aggs.iter_mut() {
+                let group_states = &mut states[group * n_aggs..(group + 1) * n_aggs];
+                for (agg, agg_state) in config.aggs.iter().zip(group_states) {
                     if agg.count_all() {
-                        agg.n += 1;
+                        agg_state.n += 1;
                     } else if let Some(col) = agg.col_index {
-                        if let Some(field) = record.get(col) {
-                            update_agg(agg, field);
+                        if let Some(value) = record.get(col) {
+                            update_agg(agg.func, agg_state, value);
                         }
                     }
                 }
@@ -1497,17 +1498,15 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
     let mut headers: Vec<Vec<u8>> = vec![group_col_name];
     headers.extend(config.aggs.iter().map(|agg| agg.header_name()));
 
-    let mut rows: Vec<Vec<Vec<u8>>> = Vec::with_capacity(order.len());
-    for key in &order {
-        let aggs = &groups[key];
-        let mut values: Vec<Vec<u8>> = vec![key.clone()];
-        for agg in aggs {
-            values.push(format_agg_value(agg, stderr)?);
-        }
-        rows.push(values);
-    }
+    let mut ordered: Vec<(Vec<u8>, usize)> = groups.into_iter().collect();
+    ordered.sort_unstable_by_key(|&(_, group)| group);
 
     if config.table {
+        let mut rows: Vec<Vec<Vec<u8>>> = Vec::with_capacity(ordered.len());
+        for (key, group) in ordered {
+            let group_states = &states[group * n_aggs..(group + 1) * n_aggs];
+            rows.push(group_values(key, &config.aggs, group_states, stderr)?);
+        }
         let mut widths: Vec<usize> = headers.iter().map(|h| display_width(h)).collect();
         for row in &rows {
             for (i, v) in row.iter().enumerate() {
@@ -1527,8 +1526,10 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
         if !config.no_header {
             write_record(writer, &headers, None, config.delimiter)?;
         }
-        for row in &rows {
-            write_record(writer, row, None, config.delimiter)?;
+        for (key, group) in ordered {
+            let group_states = &states[group * n_aggs..(group + 1) * n_aggs];
+            let values = group_values(key, &config.aggs, group_states, stderr)?;
+            write_record(writer, &values, None, config.delimiter)?;
         }
     }
 
@@ -1544,6 +1545,7 @@ fn agg_mode<R: Read, W: Write, E: Write>(
 ) -> CliResult<()> {
     let mut schema = InputSchema::default();
     let mut ready = false;
+    let mut states = vec![AggState::default(); config.aggs.len()];
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
@@ -1583,12 +1585,12 @@ fn agg_mode<R: Read, W: Write, E: Write>(
                 if !passes_filters(&config.filters, &record) {
                     continue;
                 }
-                for agg in &mut config.aggs {
+                for (agg, agg_state) in config.aggs.iter().zip(states.iter_mut()) {
                     if agg.count_all() {
-                        agg.n += 1;
+                        agg_state.n += 1;
                     } else if let Some(col) = agg.col_index {
-                        if let Some(field) = record.get(col) {
-                            update_agg(agg, field);
+                        if let Some(value) = record.get(col) {
+                            update_agg(agg.func, agg_state, value);
                         }
                     }
                 }
@@ -1599,8 +1601,8 @@ fn agg_mode<R: Read, W: Write, E: Write>(
 
     let headers: Vec<Vec<u8>> = config.aggs.iter().map(|agg| agg.header_name()).collect();
     let mut values = Vec::with_capacity(config.aggs.len());
-    for agg in &config.aggs {
-        values.push(format_agg_value(agg, stderr)?);
+    for (agg, state) in config.aggs.iter().zip(&states) {
+        values.push(format_agg_value(agg, state, stderr)?);
     }
     if config.table {
         let widths: Vec<usize> = headers
@@ -1849,53 +1851,53 @@ fn parse_f64_bytes(bytes: &[u8]) -> Option<f64> {
     std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()
 }
 
-fn update_agg(agg: &mut Agg, field_val: &[u8]) {
-    match agg.func {
+fn update_agg(func: AggFunc, state: &mut AggState, field_val: &[u8]) {
+    match func {
         AggFunc::Count => {
             if !field_val.is_empty() {
-                agg.n += 1;
+                state.n += 1;
             }
         }
         AggFunc::Sum | AggFunc::Mean => match parse_f64_bytes(field_val) {
             Some(v) => {
-                agg.total += v;
-                agg.n += 1;
+                state.total += v;
+                state.n += 1;
             }
-            None => agg.tainted = true,
+            None => state.tainted = true,
         },
         AggFunc::Min => match parse_f64_bytes(field_val) {
             Some(v) => {
-                if agg.n == 0 || v < agg.extreme {
-                    agg.extreme = v;
+                if state.n == 0 || v < state.extreme {
+                    state.extreme = v;
                 }
-                agg.n += 1;
+                state.n += 1;
             }
-            None => agg.tainted = true,
+            None => state.tainted = true,
         },
         AggFunc::Max => match parse_f64_bytes(field_val) {
             Some(v) => {
-                if agg.n == 0 || v > agg.extreme {
-                    agg.extreme = v;
+                if state.n == 0 || v > state.extreme {
+                    state.extreme = v;
                 }
-                agg.n += 1;
+                state.n += 1;
             }
-            None => agg.tainted = true,
+            None => state.tainted = true,
         },
     }
 }
 
-fn agg_result(agg: &Agg) -> f64 {
-    match agg.func {
-        AggFunc::Sum => agg.total,
+fn agg_result(func: AggFunc, state: &AggState) -> f64 {
+    match func {
+        AggFunc::Sum => state.total,
         AggFunc::Mean => {
-            if agg.n > 0 {
-                agg.total / agg.n as f64
+            if state.n > 0 {
+                state.total / state.n as f64
             } else {
                 0.0
             }
         }
-        AggFunc::Min | AggFunc::Max => agg.extreme,
-        AggFunc::Count => agg.n as f64,
+        AggFunc::Min | AggFunc::Max => state.extreme,
+        AggFunc::Count => state.n as f64,
     }
 }
 
@@ -1903,11 +1905,11 @@ fn format_number(n: f64) -> String {
     n.to_string()
 }
 
-fn format_agg_value<E: Write>(agg: &Agg, stderr: &mut E) -> CliResult<Vec<u8>> {
+fn format_agg_value<E: Write>(agg: &Agg, state: &AggState, stderr: &mut E) -> CliResult<Vec<u8>> {
     if agg.func == AggFunc::Count {
-        return Ok(agg.n.to_string().into_bytes());
+        return Ok(state.n.to_string().into_bytes());
     }
-    if agg.tainted {
+    if state.tainted {
         writeln!(
             stderr,
             "Warning: {}({}): non-numeric values encountered",
@@ -1916,7 +1918,22 @@ fn format_agg_value<E: Write>(agg: &Agg, stderr: &mut E) -> CliResult<Vec<u8>> {
         )?;
         return Ok(Vec::new());
     }
-    Ok(format_number(agg_result(agg)).into_bytes())
+    Ok(format_number(agg_result(agg.func, state)).into_bytes())
+}
+
+/// Formats one output row of grouped aggregation: the group key, then each aggregate.
+fn group_values<E: Write>(
+    key: Vec<u8>,
+    aggs: &[Agg],
+    states: &[AggState],
+    stderr: &mut E,
+) -> CliResult<Vec<Vec<u8>>> {
+    let mut values = Vec::with_capacity(aggs.len() + 1);
+    values.push(key);
+    for (agg, state) in aggs.iter().zip(states) {
+        values.push(format_agg_value(agg, state, stderr)?);
+    }
+    Ok(values)
 }
 
 fn display_width(bytes: &[u8]) -> usize {
@@ -2341,13 +2358,13 @@ mod tests {
 
     #[test]
     fn aggregate_helpers() {
-        let mut agg = Agg::new(AggFunc::Sum, "x");
-        update_agg(&mut agg, b"10");
-        update_agg(&mut agg, b"20.5");
-        assert_eq!(agg.n, 2);
-        assert!((agg.total - 30.5).abs() < 1e-9);
-        update_agg(&mut agg, b"not_a_number");
-        assert!(agg.tainted);
+        let mut state = AggState::default();
+        update_agg(AggFunc::Sum, &mut state, b"10");
+        update_agg(AggFunc::Sum, &mut state, b"20.5");
+        assert_eq!(state.n, 2);
+        assert!((state.total - 30.5).abs() < 1e-9);
+        update_agg(AggFunc::Sum, &mut state, b"not_a_number");
+        assert!(state.tainted);
         assert_eq!(parse_agg("sum:Rate:2024").unwrap().field, "Rate:2024");
         assert!(parse_agg("avg:salary").is_none());
     }
@@ -2477,6 +2494,37 @@ mod tests {
                 &input
             ),
             "0\n1\n2\n"
+        );
+    }
+
+    #[test]
+    fn run_grouped_agg_first_seen_order_and_taint() {
+        let input = b"dept,salary\nops,1\neng,2\nops,x\nhr,4\neng,3\n";
+        let mut stdin = &input[..];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run(
+            &args(&[
+                "zsv",
+                "--group-by",
+                "dept",
+                "--agg",
+                "count",
+                "--agg",
+                "sum:salary",
+            ]),
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "dept,count,sum(salary)\nops,2,\neng,2,5\nhr,1,4\n"
+        );
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "Warning: sum(salary): non-numeric values encountered\n"
         );
     }
 }
