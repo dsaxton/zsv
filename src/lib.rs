@@ -1,4 +1,5 @@
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,6 +67,10 @@ struct Agg {
     func: AggFunc,
     field: String,
     col_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AggState {
     total: f64,
     extreme: f64,
     n: usize,
@@ -78,10 +83,6 @@ impl Agg {
             func,
             field: field.to_string(),
             col_index: None,
-            total: 0.0,
-            extreme: 0.0,
-            n: 0,
-            tainted: false,
         }
     }
 
@@ -148,10 +149,67 @@ struct Config {
     group_by: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Field {
-    value: Vec<u8>,
+/// One parsed CSV row. Field bytes (quotes stripped, `""` unescaped) are packed
+/// into `data`; reusing a `Record` across rows means parsing does not allocate.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Record {
+    data: Vec<u8>,
+    fields: Vec<FieldSpan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FieldSpan {
+    start: usize,
+    end: usize,
     quoted: bool,
+}
+
+impl Record {
+    fn clear(&mut self) {
+        self.data.clear();
+        self.fields.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    fn get(&self, i: usize) -> Option<&[u8]> {
+        self.fields.get(i).map(|f| &self.data[f.start..f.end])
+    }
+
+    fn quoted(&self, i: usize) -> bool {
+        self.fields.get(i).is_some_and(|f| f.quoted)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &[u8]> {
+        self.fields.iter().map(|f| &self.data[f.start..f.end])
+    }
+
+    fn to_vecs(&self) -> Vec<Vec<u8>> {
+        self.values().map(<[u8]>::to_vec).collect()
+    }
+
+    /// Copies the fields into `out`, reusing its existing buffers.
+    fn copy_into(&self, out: &mut Vec<Vec<u8>>) {
+        out.resize_with(self.len(), Vec::new);
+        for (slot, value) in out.iter_mut().zip(self.values()) {
+            value.clone_into(slot);
+        }
+    }
+
+    /// Closes the field whose bytes start at `start` and end at the current end of `data`.
+    fn end_field(&mut self, start: usize, quoted: bool) -> Result<(), ParseRecordError> {
+        if self.fields.len() >= MAX_FIELDS {
+            return Err(ParseRecordError::TooManyFields);
+        }
+        self.fields.push(FieldSpan {
+            start,
+            end: self.data.len(),
+            quoted,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -171,14 +229,45 @@ impl ParseRecordError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct RankedRow {
     fields: Vec<Vec<u8>>,
     key: Vec<u8>,
     key_num: Option<f64>,
+    seq: usize,
+    direction: RankDirection,
 }
 
-#[derive(Clone, Debug)]
+/// Greater means ranked higher. Equal keys rank by input order (earlier first),
+/// so the kept rows match a stable sort of all rows truncated to N.
+impl Ord for RankedRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_rank_keys_for_direction(
+            self.direction,
+            self.key_num,
+            &self.key,
+            other.key_num,
+            &other.key,
+        )
+        .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for RankedRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedRow {}
+
+#[derive(Debug)]
 struct SampleRow {
     fields: Vec<Vec<u8>>,
 }
@@ -189,12 +278,10 @@ struct InputSchema {
     cols: usize,
 }
 
-struct PendingLine {
-    line: Vec<u8>,
-}
-
 struct SourceState {
-    pending_first_data: Option<PendingLine>,
+    /// With --input-no-header the first line is data: `init_input_source` leaves it
+    /// in the line buffer and `read_data_line` returns it before reading more.
+    pending_first_data: bool,
     line_no: usize,
 }
 
@@ -215,15 +302,21 @@ impl TailBuffer {
         }
     }
 
-    fn append(&mut self, row: Vec<u8>) {
-        if self.count < self.capacity {
+    /// Returns the cleared buffer for the next row, evicting the oldest row when
+    /// full. Slots keep their capacity, so steady-state tailing does not allocate.
+    fn next_slot(&mut self) -> &mut Vec<u8> {
+        let idx = if self.count < self.capacity {
             let idx = (self.start + self.count) % self.capacity;
-            self.rows[idx] = row;
             self.count += 1;
+            idx
         } else {
-            self.rows[self.start] = row;
+            let idx = self.start;
             self.start = (self.start + 1) % self.capacity;
-        }
+            idx
+        };
+        let slot = &mut self.rows[idx];
+        slot.clear();
+        slot
     }
 
     fn flush<W: Write>(&self, writer: &mut W) -> CliResult<()> {
@@ -583,39 +676,33 @@ fn parse_agg(expr: &str) -> Option<Agg> {
     Some(Agg::new(func, field))
 }
 
-fn parse_record(line: &[u8], delimiter: u8) -> Result<Vec<Field>, ParseRecordError> {
-    let mut fields = Vec::new();
+fn parse_record(line: &[u8], delimiter: u8, record: &mut Record) -> Result<(), ParseRecordError> {
+    record.clear();
     let mut i = 0;
     while i <= line.len() {
+        let start = record.data.len();
         if i == line.len() {
             if line.last() == Some(&delimiter) {
-                push_field(&mut fields, Vec::new(), false)?;
+                record.end_field(start, false)?;
             }
             break;
         }
         if line[i] == b'"' {
             i += 1;
-            let mut value = Vec::new();
-            let mut closed = false;
-            while i < line.len() {
-                if line[i] == b'"' {
-                    if i + 1 < line.len() && line[i + 1] == b'"' {
-                        value.push(b'"');
-                        i += 2;
-                    } else {
-                        i += 1;
-                        closed = true;
-                        break;
-                    }
-                } else {
-                    value.push(line[i]);
+            loop {
+                let Some(q) = line[i..].iter().position(|&c| c == b'"') else {
+                    return Err(ParseRecordError::UnterminatedQuote);
+                };
+                record.data.extend_from_slice(&line[i..i + q]);
+                i += q + 1;
+                if line.get(i) == Some(&b'"') {
+                    record.data.push(b'"');
                     i += 1;
+                } else {
+                    break;
                 }
             }
-            if !closed {
-                return Err(ParseRecordError::UnterminatedQuote);
-            }
-            push_field(&mut fields, value, true)?;
+            record.end_field(start, true)?;
             if i == line.len() {
                 break;
             } else if line[i] == delimiter {
@@ -624,42 +711,30 @@ fn parse_record(line: &[u8], delimiter: u8) -> Result<Vec<Field>, ParseRecordErr
                 return Err(ParseRecordError::MalformedQuotedField);
             }
         } else {
-            let start = i;
-            while i < line.len() && line[i] != delimiter {
-                i += 1;
-            }
-            push_field(&mut fields, line[start..i].to_vec(), false)?;
-            if i < line.len() {
-                i += 1;
+            let end = line[i..]
+                .iter()
+                .position(|&c| c == delimiter)
+                .map_or(line.len(), |p| i + p);
+            record.data.extend_from_slice(&line[i..end]);
+            record.end_field(start, false)?;
+            if end < line.len() {
+                i = end + 1;
             } else {
                 break;
             }
         }
     }
-    Ok(fields)
-}
-
-fn push_field(
-    fields: &mut Vec<Field>,
-    value: Vec<u8>,
-    quoted: bool,
-) -> Result<(), ParseRecordError> {
-    if fields.len() >= MAX_FIELDS {
-        return Err(ParseRecordError::TooManyFields);
-    }
-    fields.push(Field { value, quoted });
     Ok(())
 }
 
-fn read_next_line<R: BufRead + ?Sized>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-) -> io::Result<Option<Vec<u8>>> {
+/// Reads the next non-empty line into `buf`, without its line terminator.
+/// Returns false at end of input.
+fn read_next_line<R: BufRead + ?Sized>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<bool> {
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', buf)?;
         if n == 0 {
-            return Ok(None);
+            return Ok(false);
         }
         if buf.len() > MAX_LINE_LEN {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
@@ -673,7 +748,7 @@ fn read_next_line<R: BufRead + ?Sized>(
         if buf.is_empty() {
             continue;
         }
-        return Ok(Some(buf.clone()));
+        return Ok(true);
     }
 }
 
@@ -681,16 +756,17 @@ fn read_data_line<R: BufRead + ?Sized>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     state: &mut SourceState,
-) -> io::Result<Option<Vec<u8>>> {
-    if let Some(pending) = state.pending_first_data.take() {
+) -> io::Result<bool> {
+    if state.pending_first_data {
+        state.pending_first_data = false;
         state.line_no += 1;
-        return Ok(Some(pending.line));
+        return Ok(true);
     }
-    let line = read_next_line(reader, buf)?;
-    if line.is_some() {
+    let found = read_next_line(reader, buf)?;
+    if found {
         state.line_no += 1;
     }
-    Ok(line)
+    Ok(found)
 }
 
 fn resolve_column_index(header: &[Vec<u8>], selector: &str) -> CliResult<usize> {
@@ -733,12 +809,12 @@ fn resolve_output_state(
     Ok(col_indices)
 }
 
-fn headers_match(expected: &[Vec<u8>], actual: &[Field]) -> bool {
+fn headers_match(expected: &[Vec<u8>], actual: &Record) -> bool {
     expected.len() == actual.len()
         && expected
             .iter()
-            .zip(actual)
-            .all(|(a, b)| a.as_slice() == b.value.as_slice())
+            .zip(actual.values())
+            .all(|(a, b)| a.as_slice() == b)
 }
 
 fn init_input_source<R: BufRead + ?Sized>(
@@ -747,13 +823,12 @@ fn init_input_source<R: BufRead + ?Sized>(
     config: &Config,
     schema: &mut InputSchema,
     buf: &mut Vec<u8>,
+    record: &mut Record,
 ) -> CliResult<Option<SourceState>> {
-    let first_line =
-        match read_next_line(reader, buf).map_err(|err| read_error(source_name, 1, err))? {
-            Some(line) => line,
-            None => return Ok(None),
-        };
-    let result = parse_record(&first_line, config.delimiter).map_err(|err| {
+    if !read_next_line(reader, buf).map_err(|err| read_error(source_name, 1, err))? {
+        return Ok(None);
+    }
+    parse_record(buf, config.delimiter, record).map_err(|err| {
         CliError::Message(format!(
             "Error parsing CSV in {source_name} on line 1: {}",
             err.message()
@@ -761,33 +836,33 @@ fn init_input_source<R: BufRead + ?Sized>(
     })?;
     if config.input_no_header {
         if schema.header.is_none() {
-            schema.cols = result.len();
-            schema.header = Some(make_synthetic_header(result.len()));
-        } else if result.len() != schema.cols {
+            schema.cols = record.len();
+            schema.header = Some(make_synthetic_header(record.len()));
+        } else if record.len() != schema.cols {
             return Err(CliError::Message(format!(
                 "Error: column count mismatch in {source_name}: expected {}, got {}",
                 schema.cols,
-                result.len()
+                record.len()
             )));
         }
         return Ok(Some(SourceState {
-            pending_first_data: Some(PendingLine { line: first_line }),
+            pending_first_data: true,
             line_no: 0,
         }));
     }
 
     if let Some(header) = &schema.header {
-        if !headers_match(header, &result) {
+        if !headers_match(header, record) {
             return Err(CliError::Message(format!(
                 "Error: header mismatch in {source_name}"
             )));
         }
     } else {
-        schema.cols = result.len();
-        schema.header = Some(result.into_iter().map(|f| f.value).collect());
+        schema.cols = record.len();
+        schema.header = Some(record.to_vecs());
     }
     Ok(Some(SourceState {
-        pending_first_data: None,
+        pending_first_data: false,
         line_no: 1,
     }))
 }
@@ -811,8 +886,9 @@ fn parse_row_for_source(
     config: &Config,
     source_name: &str,
     line_no: usize,
-) -> CliResult<Vec<Field>> {
-    parse_record(line, config.delimiter).map_err(|err| {
+    record: &mut Record,
+) -> CliResult<()> {
+    parse_record(line, config.delimiter, record).map_err(|err| {
         CliError::Message(format!(
             "Error parsing CSV in {source_name} on line {line_no}: {}",
             err.message()
@@ -946,21 +1022,28 @@ fn validate_inputs<R: Read>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if row.len() != schema.cols {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if record.len() != schema.cols {
                     return Err(CliError::Message(format!(
                         "Error: column count mismatch in {source_name} on line {}: expected {}, got {}",
                         state.line_no,
                         schema.cols,
-                        row.len()
+                        record.len()
                     )));
                 }
                 rows_seen += 1;
@@ -986,21 +1069,28 @@ fn fast_pass_through<R: Read, W: Write>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
+            let mut record = Record::default();
             if config.input_no_header {
-                while let Some(line) = read_next_line(reader, &mut line_buf)
+                while read_next_line(reader, &mut line_buf)
                     .map_err(|err| read_error(source_name, rows_written + 1, err))?
                 {
                     if config.head.is_some_and(|limit| rows_written >= limit) {
                         break;
                     }
-                    write_raw_line_tail_aware(writer, tail.as_mut(), &line)?;
+                    write_raw_line_tail_aware(writer, tail.as_mut(), &line_buf)?;
                     rows_written += 1;
                 }
                 return Ok(());
             }
 
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, schema, &mut line_buf)?
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1013,13 +1103,13 @@ fn fast_pass_through<R: Read, W: Write>(
                 )?;
                 header_emitted = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
                 if config.head.is_some_and(|limit| rows_written >= limit) {
                     break;
                 }
-                write_raw_line_tail_aware(writer, tail.as_mut(), &line)?;
+                write_raw_line_tail_aware(writer, tail.as_mut(), &line_buf)?;
                 rows_written += 1;
             }
             Ok(())
@@ -1037,10 +1127,9 @@ fn write_raw_line_tail_aware<W: Write>(
     line: &[u8],
 ) -> CliResult<()> {
     if let Some(tail) = tail {
-        let mut row = Vec::with_capacity(line.len() + 1);
-        row.extend_from_slice(line);
-        row.push(b'\n');
-        tail.append(row);
+        let slot = tail.next_slot();
+        slot.extend_from_slice(line);
+        slot.push(b'\n');
     } else {
         writer.write_all(line)?;
         writer.write_all(b"\n")?;
@@ -1065,8 +1154,15 @@ fn csv_transform_mode<R: Read, W: Write>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1087,18 +1183,18 @@ fn csv_transform_mode<R: Read, W: Write>(
                 )?;
                 header_emitted = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
                 if config.head.is_some_and(|limit| rows_written >= limit) {
                     break;
                 }
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if passes_filters(&config.filters, &record) {
                     write_fields_tail_aware(
                         writer,
                         tail.as_mut(),
-                        &row,
+                        &record,
                         col_indices.as_deref(),
                         config.delimiter,
                     )?;
@@ -1117,16 +1213,14 @@ fn csv_transform_mode<R: Read, W: Write>(
 fn write_fields_tail_aware<W: Write>(
     writer: &mut W,
     tail: Option<&mut TailBuffer>,
-    row: &[Field],
+    record: &Record,
     col_indices: Option<&[usize]>,
     delimiter: u8,
 ) -> CliResult<()> {
     if let Some(tail) = tail {
-        let mut buf = Vec::new();
-        write_fields(&mut buf, row, col_indices, delimiter)?;
-        tail.append(buf);
+        write_fields(tail.next_slot(), record, col_indices, delimiter)?;
     } else {
-        write_fields(writer, row, col_indices, delimiter)?;
+        write_fields(writer, record, col_indices, delimiter)?;
     }
     Ok(())
 }
@@ -1149,8 +1243,15 @@ fn sample_mode<R: Read, W: Write>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1162,20 +1263,21 @@ fn sample_mode<R: Read, W: Write>(
                 )?;
                 ready = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
-                let cloned = clone_field_values(&row);
                 if reservoir.len() < sample_n {
-                    reservoir.push(SampleRow { fields: cloned });
+                    reservoir.push(SampleRow {
+                        fields: record.to_vecs(),
+                    });
                 } else {
                     let j = prng.range_less_than(rows_seen + 1);
                     if j < sample_n {
-                        reservoir[j] = SampleRow { fields: cloned };
+                        record.copy_into(&mut reservoir[j].fields);
                     }
                 }
                 rows_seen += 1;
@@ -1211,13 +1313,22 @@ fn rank_mode<R: Read, W: Write>(
     let mut col_indices: Option<Vec<usize>> = None;
     let mut rank_col_index: Option<usize> = None;
     let mut ready = false;
-    let mut ranked_rows: Vec<RankedRow> = Vec::new();
+    // Min-heap of the best `limit` rows seen so far; the root is the current worst.
+    let mut heap: BinaryHeap<Reverse<RankedRow>> = BinaryHeap::with_capacity(limit);
+    let mut seq = 0;
 
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1233,54 +1344,52 @@ fn rank_mode<R: Read, W: Write>(
                 )?);
                 ready = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
                 let rank_idx = rank_col_index.unwrap();
-                let key = row.get(rank_idx).map(|f| f.value.as_slice()).unwrap_or(b"");
+                let key = record.get(rank_idx).unwrap_or(b"");
                 let key_num = parse_f64_bytes(key);
-                if ranked_rows.len() < limit {
-                    let fields = clone_field_values(&row);
-                    let duped_key = fields.get(rank_idx).cloned().unwrap_or_default();
-                    ranked_rows.push(RankedRow {
-                        fields,
-                        key: duped_key,
+                if heap.len() < limit {
+                    heap.push(Reverse(RankedRow {
+                        fields: record.to_vecs(),
+                        key: key.to_vec(),
                         key_num,
-                    });
+                        seq,
+                        direction: rank_cfg.direction,
+                    }));
                 } else {
-                    let wi = worst_rank_index(rank_cfg.direction, &ranked_rows);
-                    let worst = &ranked_rows[wi];
+                    let mut worst = heap.peek_mut().expect("heap holds limit > 0 rows");
+                    // A later row with an equal key ranks lower, so it must be strictly better.
                     if compare_rank_keys_for_direction(
                         rank_cfg.direction,
                         key_num,
                         key,
-                        worst.key_num,
-                        &worst.key,
+                        worst.0.key_num,
+                        &worst.0.key,
                     ) == Ordering::Greater
                     {
-                        let fields = clone_field_values(&row);
-                        let duped_key = fields.get(rank_idx).cloned().unwrap_or_default();
-                        ranked_rows[wi] = RankedRow {
-                            fields,
-                            key: duped_key,
-                            key_num,
-                        };
+                        let row = &mut worst.0;
+                        record.copy_into(&mut row.fields);
+                        row.key.clear();
+                        row.key.extend_from_slice(key);
+                        row.key_num = key_num;
+                        row.seq = seq;
                     }
                 }
+                seq += 1;
             }
             Ok(())
         })?;
     }
-    ranked_rows.sort_by(|a, b| {
-        compare_rank_keys_for_direction(rank_cfg.direction, b.key_num, &b.key, a.key_num, &a.key)
-    });
+    let ranked_rows = heap.into_sorted_vec();
     let rows: Vec<&[Vec<u8>]> = ranked_rows
         .iter()
-        .map(|row| row.fields.as_slice())
+        .map(|Reverse(row)| row.fields.as_slice())
         .collect();
     write_rows(
         writer,
@@ -1305,15 +1414,24 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
     let mut schema = InputSchema::default();
     let mut ready = false;
     let mut group_col_index: usize = 0;
-    let mut fresh_aggs: Vec<Agg> = Vec::new();
-    let mut groups: HashMap<Vec<u8>, Vec<Agg>> = HashMap::new();
-    let mut order: Vec<Vec<u8>> = Vec::new();
+    let n_aggs = config.aggs.len();
+    // Group key -> group number in first-seen order. Accumulators for group g are
+    // states[g * n_aggs..(g + 1) * n_aggs]. Each key is stored once.
+    let mut groups: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut states: Vec<AggState> = Vec::new();
 
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1330,33 +1448,32 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
                         )?);
                     }
                 }
-                fresh_aggs = config.aggs.clone();
                 ready = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
-                let key = row
-                    .get(group_col_index)
-                    .map(|f| f.value.clone())
-                    .unwrap_or_default();
-                let aggs = match groups.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        order.push(e.key().clone());
-                        e.insert(fresh_aggs.clone())
+                let key = record.get(group_col_index).unwrap_or(b"");
+                let group = match groups.get(key) {
+                    Some(&group) => group,
+                    None => {
+                        let group = groups.len();
+                        groups.insert(key.to_vec(), group);
+                        states.resize(states.len() + n_aggs, AggState::default());
+                        group
                     }
                 };
-                for agg in aggs.iter_mut() {
+                let group_states = &mut states[group * n_aggs..(group + 1) * n_aggs];
+                for (agg, agg_state) in config.aggs.iter().zip(group_states) {
                     if agg.count_all() {
-                        agg.n += 1;
+                        agg_state.n += 1;
                     } else if let Some(col) = agg.col_index {
-                        if let Some(field) = row.get(col) {
-                            update_agg(agg, &field.value);
+                        if let Some(value) = record.get(col) {
+                            update_agg(agg.func, agg_state, value);
                         }
                     }
                 }
@@ -1375,17 +1492,15 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
     let mut headers: Vec<Vec<u8>> = vec![group_col_name];
     headers.extend(config.aggs.iter().map(|agg| agg.header_name()));
 
-    let mut rows: Vec<Vec<Vec<u8>>> = Vec::with_capacity(order.len());
-    for key in &order {
-        let aggs = &groups[key];
-        let mut values: Vec<Vec<u8>> = vec![key.clone()];
-        for agg in aggs {
-            values.push(format_agg_value(agg, stderr)?);
-        }
-        rows.push(values);
-    }
+    let mut ordered: Vec<(Vec<u8>, usize)> = groups.into_iter().collect();
+    ordered.sort_unstable_by_key(|&(_, group)| group);
 
     if config.table {
+        let mut rows: Vec<Vec<Vec<u8>>> = Vec::with_capacity(ordered.len());
+        for (key, group) in ordered {
+            let group_states = &states[group * n_aggs..(group + 1) * n_aggs];
+            rows.push(group_values(key, &config.aggs, group_states, stderr)?);
+        }
         let mut widths: Vec<usize> = headers.iter().map(|h| display_width(h)).collect();
         for row in &rows {
             for (i, v) in row.iter().enumerate() {
@@ -1405,8 +1520,10 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
         if !config.no_header {
             write_record(writer, &headers, None, config.delimiter)?;
         }
-        for row in &rows {
-            write_record(writer, row, None, config.delimiter)?;
+        for (key, group) in ordered {
+            let group_states = &states[group * n_aggs..(group + 1) * n_aggs];
+            let values = group_values(key, &config.aggs, group_states, stderr)?;
+            write_record(writer, &values, None, config.delimiter)?;
         }
     }
 
@@ -1422,11 +1539,19 @@ fn agg_mode<R: Read, W: Write, E: Write>(
 ) -> CliResult<()> {
     let mut schema = InputSchema::default();
     let mut ready = false;
+    let mut states = vec![AggState::default(); config.aggs.len()];
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1447,19 +1572,19 @@ fn agg_mode<R: Read, W: Write, E: Write>(
                 }
                 ready = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
-                for agg in &mut config.aggs {
+                for (agg, agg_state) in config.aggs.iter().zip(states.iter_mut()) {
                     if agg.count_all() {
-                        agg.n += 1;
+                        agg_state.n += 1;
                     } else if let Some(col) = agg.col_index {
-                        if let Some(field) = row.get(col) {
-                            update_agg(agg, &field.value);
+                        if let Some(value) = record.get(col) {
+                            update_agg(agg.func, agg_state, value);
                         }
                     }
                 }
@@ -1470,8 +1595,8 @@ fn agg_mode<R: Read, W: Write, E: Write>(
 
     let headers: Vec<Vec<u8>> = config.aggs.iter().map(|agg| agg.header_name()).collect();
     let mut values = Vec::with_capacity(config.aggs.len());
-    for agg in &config.aggs {
-        values.push(format_agg_value(agg, stderr)?);
+    for (agg, state) in config.aggs.iter().zip(&states) {
+        values.push(format_agg_value(agg, state, stderr)?);
     }
     if config.table {
         let widths: Vec<usize> = headers
@@ -1509,12 +1634,20 @@ fn table_mode<R: Read, W: Write>(
     let mut buffered_rows: Vec<Vec<Vec<u8>>> = Vec::new();
     let mut sample_bytes = 0;
     let mut rows_written = 0;
+    let mut row_buf: Vec<Vec<u8>> = Vec::new();
 
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1536,16 +1669,16 @@ fn table_mode<R: Read, W: Write>(
                     .head
                     .is_some_and(|limit| buffered_rows.len() >= limit)
             {
-                let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+                if !read_data_line(reader, &mut line_buf, &mut state)
                     .map_err(|err| read_error(source_name, state.line_no + 1, err))?
-                else {
+                {
                     break;
-                };
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                }
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
-                let cloned = clone_field_values(&row);
+                let cloned = record.to_vecs();
                 sample_bytes += cloned.iter().map(Vec::len).sum::<usize>();
                 update_widths(&mut widths, &cloned, col_indices.as_deref());
                 buffered_rows.push(cloned);
@@ -1571,15 +1704,15 @@ fn table_mode<R: Read, W: Write>(
             }
 
             while !config.head.is_some_and(|limit| rows_written >= limit) {
-                let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+                if !read_data_line(reader, &mut line_buf, &mut state)
                     .map_err(|err| read_error(source_name, state.line_no + 1, err))?
-                else {
+                {
                     break;
-                };
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if passes_filters(&config.filters, &row) {
-                    let cloned = clone_field_values(&row);
-                    write_table_row(writer, &cloned, col_indices.as_deref(), &widths)?;
+                }
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if passes_filters(&config.filters, &record) {
+                    record.copy_into(&mut row_buf);
+                    write_table_row(writer, &row_buf, col_indices.as_deref(), &widths)?;
                     rows_written += 1;
                 }
             }
@@ -1624,27 +1757,22 @@ fn update_widths(widths: &mut [usize], row: &[Vec<u8>], col_indices: Option<&[us
     }
 }
 
-fn clone_field_values(row: &[Field]) -> Vec<Vec<u8>> {
-    row.iter().map(|field| field.value.clone()).collect()
+fn passes_filters(filters: &[Filter], record: &Record) -> bool {
+    filters.iter().all(|filter| evaluate_filter(filter, record))
 }
 
-fn passes_filters(filters: &[Filter], fields: &[Field]) -> bool {
-    filters.iter().all(|filter| evaluate_filter(filter, fields))
-}
-
-fn evaluate_filter(filter: &Filter, fields: &[Field]) -> bool {
+fn evaluate_filter(filter: &Filter, record: &Record) -> bool {
     let Some(col_index) = filter.col_index else {
         return true;
     };
-    let Some(field) = fields.get(col_index) else {
+    let Some(value) = record.get(col_index) else {
         return false;
     };
-    let field_val = String::from_utf8_lossy(&field.value);
     if filter.op == FilterOp::Like {
-        return glob_match(filter.value.as_bytes(), &field.value);
+        return glob_match(filter.value.as_bytes(), value);
     }
     if let Some(b) = filter.value_num {
-        let Ok(a) = field_val.parse::<f64>() else {
+        let Some(a) = parse_f64_bytes(value) else {
             return false;
         };
         return match filter.op {
@@ -1657,7 +1785,7 @@ fn evaluate_filter(filter: &Filter, fields: &[Field]) -> bool {
             FilterOp::Like => unreachable!(),
         };
     }
-    match field.value.as_slice().cmp(filter.value.as_bytes()) {
+    match value.cmp(filter.value.as_bytes()) {
         Ordering::Equal => matches!(filter.op, FilterOp::Eq | FilterOp::Lte | FilterOp::Gte),
         Ordering::Less => matches!(filter.op, FilterOp::Neq | FilterOp::Lt | FilterOp::Lte),
         Ordering::Greater => matches!(filter.op, FilterOp::Neq | FilterOp::Gt | FilterOp::Gte),
@@ -1691,14 +1819,10 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     true
 }
 
-fn compare_rank_keys(a_num: Option<f64>, a: &[u8], b_num: Option<f64>, b: &[u8]) -> Ordering {
-    if let (Some(a), Some(b)) = (a_num, b_num) {
-        a.partial_cmp(&b).unwrap_or(Ordering::Equal)
-    } else {
-        a.cmp(b)
-    }
-}
-
+/// A total order over rank keys; greater means ranked higher. Keys that parse as
+/// numbers rank ahead of non-numeric keys in both directions. Within each class,
+/// numbers compare with `f64::total_cmp` and text compares as bytes, and `direction`
+/// picks which end of that class ranks higher.
 fn compare_rank_keys_for_direction(
     direction: RankDirection,
     a_num: Option<f64>,
@@ -1706,81 +1830,69 @@ fn compare_rank_keys_for_direction(
     b_num: Option<f64>,
     b: &[u8],
 ) -> Ordering {
-    let base = compare_rank_keys(a_num, a, b_num, b);
-    match direction {
-        RankDirection::Greatest => base,
-        RankDirection::Least => base.reverse(),
+    let within_class = |ord: Ordering| match direction {
+        RankDirection::Greatest => ord,
+        RankDirection::Least => ord.reverse(),
+    };
+    match (a_num, b_num) {
+        (Some(x), Some(y)) => within_class(x.total_cmp(&y)),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => within_class(a.cmp(b)),
     }
-}
-
-fn worst_rank_index(direction: RankDirection, rows: &[RankedRow]) -> usize {
-    let mut worst = 0;
-    for i in 1..rows.len() {
-        if compare_rank_keys_for_direction(
-            direction,
-            rows[i].key_num,
-            &rows[i].key,
-            rows[worst].key_num,
-            &rows[worst].key,
-        ) == Ordering::Less
-        {
-            worst = i;
-        }
-    }
-    worst
 }
 
 fn parse_f64_bytes(bytes: &[u8]) -> Option<f64> {
     std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()
 }
 
-fn update_agg(agg: &mut Agg, field_val: &[u8]) {
-    match agg.func {
+fn update_agg(func: AggFunc, state: &mut AggState, field_val: &[u8]) {
+    match func {
         AggFunc::Count => {
             if !field_val.is_empty() {
-                agg.n += 1;
+                state.n += 1;
             }
         }
         AggFunc::Sum | AggFunc::Mean => match parse_f64_bytes(field_val) {
             Some(v) => {
-                agg.total += v;
-                agg.n += 1;
+                state.total += v;
+                state.n += 1;
             }
-            None => agg.tainted = true,
+            None => state.tainted = true,
         },
         AggFunc::Min => match parse_f64_bytes(field_val) {
             Some(v) => {
-                if agg.n == 0 || v < agg.extreme {
-                    agg.extreme = v;
+                if state.n == 0 || v < state.extreme {
+                    state.extreme = v;
                 }
-                agg.n += 1;
+                state.n += 1;
             }
-            None => agg.tainted = true,
+            None => state.tainted = true,
         },
         AggFunc::Max => match parse_f64_bytes(field_val) {
             Some(v) => {
-                if agg.n == 0 || v > agg.extreme {
-                    agg.extreme = v;
+                if state.n == 0 || v > state.extreme {
+                    state.extreme = v;
                 }
-                agg.n += 1;
+                state.n += 1;
             }
-            None => agg.tainted = true,
+            None => state.tainted = true,
         },
     }
 }
 
-fn agg_result(agg: &Agg) -> f64 {
-    match agg.func {
-        AggFunc::Sum => agg.total,
+fn agg_result(func: AggFunc, state: &AggState) -> f64 {
+    match func {
+        AggFunc::Sum => state.total,
         AggFunc::Mean => {
-            if agg.n > 0 {
-                agg.total / agg.n as f64
+            if state.n > 0 {
+                state.total / state.n as f64
             } else {
                 0.0
             }
         }
-        AggFunc::Min | AggFunc::Max => agg.extreme,
-        AggFunc::Count => agg.n as f64,
+        AggFunc::Min | AggFunc::Max => state.extreme,
+        AggFunc::Count => state.n as f64,
     }
 }
 
@@ -1788,11 +1900,11 @@ fn format_number(n: f64) -> String {
     n.to_string()
 }
 
-fn format_agg_value<E: Write>(agg: &Agg, stderr: &mut E) -> CliResult<Vec<u8>> {
+fn format_agg_value<E: Write>(agg: &Agg, state: &AggState, stderr: &mut E) -> CliResult<Vec<u8>> {
     if agg.func == AggFunc::Count {
-        return Ok(agg.n.to_string().into_bytes());
+        return Ok(state.n.to_string().into_bytes());
     }
-    if agg.tainted {
+    if state.tainted {
         writeln!(
             stderr,
             "Warning: {}({}): non-numeric values encountered",
@@ -1801,7 +1913,22 @@ fn format_agg_value<E: Write>(agg: &Agg, stderr: &mut E) -> CliResult<Vec<u8>> {
         )?;
         return Ok(Vec::new());
     }
-    Ok(format_number(agg_result(agg)).into_bytes())
+    Ok(format_number(agg_result(agg.func, state)).into_bytes())
+}
+
+/// Formats one output row of grouped aggregation: the group key, then each aggregate.
+fn group_values<E: Write>(
+    key: Vec<u8>,
+    aggs: &[Agg],
+    states: &[AggState],
+    stderr: &mut E,
+) -> CliResult<Vec<Vec<u8>>> {
+    let mut values = Vec::with_capacity(aggs.len() + 1);
+    values.push(key);
+    for (agg, state) in aggs.iter().zip(states) {
+        values.push(format_agg_value(agg, state, stderr)?);
+    }
+    Ok(values)
 }
 
 fn display_width(bytes: &[u8]) -> usize {
@@ -1823,18 +1950,28 @@ fn display_width(bytes: &[u8]) -> usize {
     width
 }
 
+fn write_repeated<W: Write>(writer: &mut W, byte: u8, count: usize) -> CliResult<()> {
+    let chunk = [byte; 64];
+    let mut remaining = count;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        writer.write_all(&chunk[..n])?;
+        remaining -= n;
+    }
+    Ok(())
+}
+
 fn write_field<W: Write>(writer: &mut W, field: &[u8], delimiter: u8) -> CliResult<()> {
     let needs_quoting = field
         .iter()
         .any(|&c| c == b'"' || c == b'\n' || c == b'\r' || c == delimiter);
     if needs_quoting {
         writer.write_all(b"\"")?;
-        for &c in field {
-            if c == b'"' {
+        for (i, part) in field.split(|&c| c == b'"').enumerate() {
+            if i > 0 {
                 writer.write_all(b"\"\"")?;
-            } else {
-                writer.write_all(&[c])?;
             }
+            writer.write_all(part)?;
         }
         writer.write_all(b"\"")?;
     } else {
@@ -1872,15 +2009,18 @@ fn write_record<W: Write>(
 
 fn write_fields<W: Write>(
     writer: &mut W,
-    fields: &[Field],
+    record: &Record,
     col_indices: Option<&[usize]>,
     delimiter: u8,
 ) -> CliResult<()> {
-    let write_one = |writer: &mut W, field: &Field| -> CliResult<()> {
-        if field.quoted {
-            write_field(writer, &field.value, delimiter)
+    let write_one = |writer: &mut W, idx: usize| -> CliResult<()> {
+        let Some(value) = record.get(idx) else {
+            return Ok(());
+        };
+        if record.quoted(idx) {
+            write_field(writer, value, delimiter)
         } else {
-            writer.write_all(&field.value)?;
+            writer.write_all(value)?;
             Ok(())
         }
     };
@@ -1889,16 +2029,14 @@ fn write_fields<W: Write>(
             if i > 0 {
                 writer.write_all(&[delimiter])?;
             }
-            if let Some(field) = fields.get(idx) {
-                write_one(writer, field)?;
-            }
+            write_one(writer, idx)?;
         }
     } else {
-        for (i, field) in fields.iter().enumerate() {
-            if i > 0 {
+        for idx in 0..record.len() {
+            if idx > 0 {
                 writer.write_all(&[delimiter])?;
             }
-            write_one(writer, field)?;
+            write_one(writer, idx)?;
         }
     }
     writer.write_all(b"\n")?;
@@ -1942,9 +2080,7 @@ fn write_table_separator<W: Write>(writer: &mut W, widths: &[usize]) -> CliResul
         if i > 0 {
             writer.write_all(b"-+-")?;
         }
-        for _ in 0..w {
-            writer.write_all(b"-")?;
-        }
+        write_repeated(writer, b'-', w)?;
     }
     writer.write_all(b"\n")?;
     Ok(())
@@ -1963,9 +2099,7 @@ fn write_table_row<W: Write>(
             }
             let val = fields.get(idx).map(Vec::as_slice).unwrap_or(b"");
             writer.write_all(val)?;
-            for _ in display_width(val)..widths[i] {
-                writer.write_all(b" ")?;
-            }
+            write_repeated(writer, b' ', widths[i].saturating_sub(display_width(val)))?;
         }
     } else {
         for (i, &w) in widths.iter().enumerate() {
@@ -1974,9 +2108,7 @@ fn write_table_row<W: Write>(
             }
             let val = fields.get(i).map(Vec::as_slice).unwrap_or(b"");
             writer.write_all(val)?;
-            for _ in display_width(val)..w {
-                writer.write_all(b" ")?;
-            }
+            write_repeated(writer, b' ', w.saturating_sub(display_width(val)))?;
         }
     }
     writer.write_all(b"\n")?;
@@ -1991,45 +2123,50 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    fn values(row: &[Field]) -> Vec<String> {
-        row.iter()
-            .map(|f| String::from_utf8_lossy(&f.value).into_owned())
+    fn values(row: &Record) -> Vec<String> {
+        row.values()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
             .collect()
+    }
+
+    fn parse(line: &[u8], delimiter: u8) -> Result<Record, ParseRecordError> {
+        let mut record = Record::default();
+        parse_record(line, delimiter, &mut record).map(|()| record)
     }
 
     #[test]
     fn parse_record_simple_unquoted_fields() {
-        let row = parse_record(b"alice,30,Engineering", DEFAULT_DELIMITER).unwrap();
+        let row = parse(b"alice,30,Engineering", DEFAULT_DELIMITER).unwrap();
         assert_eq!(values(&row), ["alice", "30", "Engineering"]);
     }
 
     #[test]
     fn parse_record_empty_fields() {
-        let row = parse_record(b",a,,b,", DEFAULT_DELIMITER).unwrap();
+        let row = parse(b",a,,b,", DEFAULT_DELIMITER).unwrap();
         assert_eq!(values(&row), ["", "a", "", "b", ""]);
     }
 
     #[test]
     fn parse_record_quoted_and_escaped() {
-        let row = parse_record(b"\"she said \"\"hi\"\"\",ok", DEFAULT_DELIMITER).unwrap();
+        let row = parse(b"\"she said \"\"hi\"\"\",ok", DEFAULT_DELIMITER).unwrap();
         assert_eq!(values(&row), ["she said \"hi\"", "ok"]);
-        assert!(row[0].quoted);
+        assert!(row.quoted(0));
     }
 
     #[test]
     fn parse_record_custom_delimiter() {
-        let row = parse_record(b"alice\t\"sales, west\"\t42", b'\t').unwrap();
+        let row = parse(b"alice\t\"sales, west\"\t42", b'\t').unwrap();
         assert_eq!(values(&row), ["alice", "sales, west", "42"]);
     }
 
     #[test]
     fn parse_record_errors() {
         assert_eq!(
-            parse_record(b"\"x\"oops,2", DEFAULT_DELIMITER),
+            parse(b"\"x\"oops,2", DEFAULT_DELIMITER),
             Err(ParseRecordError::MalformedQuotedField)
         );
         assert_eq!(
-            parse_record(b"\"abc,def", DEFAULT_DELIMITER),
+            parse(b"\"abc,def", DEFAULT_DELIMITER),
             Err(ParseRecordError::UnterminatedQuote)
         );
         let mut line = Vec::new();
@@ -2040,7 +2177,7 @@ mod tests {
             line.push(b'x');
         }
         assert_eq!(
-            parse_record(&line, DEFAULT_DELIMITER),
+            parse(&line, DEFAULT_DELIMITER),
             Err(ParseRecordError::TooManyFields)
         );
     }
@@ -2117,7 +2254,15 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         run(
-            &args(&["zsv", "--group-by", "dept", "--agg", "count", "--agg", "mean:salary"]),
+            &args(&[
+                "zsv",
+                "--group-by",
+                "dept",
+                "--agg",
+                "count",
+                "--agg",
+                "mean:salary",
+            ]),
             &mut stdin,
             &mut stdout,
             &mut stderr,
@@ -2163,7 +2308,7 @@ mod tests {
 
     #[test]
     fn evaluate_filter_numeric_and_string() {
-        let fields = parse_record(b"Alice,150000,Engineering", DEFAULT_DELIMITER).unwrap();
+        let fields = parse(b"Alice,150000,Engineering", DEFAULT_DELIMITER).unwrap();
         let mut f = parse_filter("salary>100000").unwrap();
         f.col_index = Some(1);
         assert!(evaluate_filter(&f, &fields));
@@ -2178,34 +2323,25 @@ mod tests {
 
     #[test]
     fn rank_helpers() {
+        use RankDirection::{Greatest, Least};
+        let cmp = compare_rank_keys_for_direction;
         assert_eq!(
-            compare_rank_keys(Some(5.0), b"5", Some(3.0), b"3"),
+            cmp(Greatest, Some(5.0), b"5", Some(3.0), b"3"),
             Ordering::Greater
         );
-        assert_eq!(compare_rank_keys(None, b"b", None, b"a"), Ordering::Greater);
+        assert_eq!(cmp(Least, Some(5.0), b"5", Some(3.0), b"3"), Ordering::Less);
+        assert_eq!(cmp(Greatest, None, b"b", None, b"a"), Ordering::Greater);
+        assert_eq!(cmp(Least, None, b"b", None, b"a"), Ordering::Less);
+        // A numeric key outranks a non-numeric one in both directions.
         assert_eq!(
-            compare_rank_keys(Some(10.0), b"10", None, b"9"),
-            Ordering::Less
+            cmp(Greatest, Some(10.0), b"10", None, b"9x"),
+            Ordering::Greater
         );
-        let rows = vec![
-            RankedRow {
-                fields: vec![],
-                key: b"10".to_vec(),
-                key_num: Some(10.0),
-            },
-            RankedRow {
-                fields: vec![],
-                key: b"3".to_vec(),
-                key_num: Some(3.0),
-            },
-            RankedRow {
-                fields: vec![],
-                key: b"7".to_vec(),
-                key_num: Some(7.0),
-            },
-        ];
-        assert_eq!(worst_rank_index(RankDirection::Greatest, &rows), 1);
-        assert_eq!(worst_rank_index(RankDirection::Least, &rows), 0);
+        assert_eq!(
+            cmp(Least, Some(10.0), b"10", None, b"9x"),
+            Ordering::Greater
+        );
+        assert_eq!(cmp(Least, None, b"9x", Some(10.0), b"10"), Ordering::Less);
     }
 
     #[test]
@@ -2235,13 +2371,13 @@ mod tests {
 
     #[test]
     fn aggregate_helpers() {
-        let mut agg = Agg::new(AggFunc::Sum, "x");
-        update_agg(&mut agg, b"10");
-        update_agg(&mut agg, b"20.5");
-        assert_eq!(agg.n, 2);
-        assert!((agg.total - 30.5).abs() < 1e-9);
-        update_agg(&mut agg, b"not_a_number");
-        assert!(agg.tainted);
+        let mut state = AggState::default();
+        update_agg(AggFunc::Sum, &mut state, b"10");
+        update_agg(AggFunc::Sum, &mut state, b"20.5");
+        assert_eq!(state.n, 2);
+        assert!((state.total - 30.5).abs() < 1e-9);
+        update_agg(AggFunc::Sum, &mut state, b"not_a_number");
+        assert!(state.tainted);
         assert_eq!(parse_agg("sum:Rate:2024").unwrap().field, "Rate:2024");
         assert!(parse_agg("avg:salary").is_none());
     }
@@ -2274,6 +2410,168 @@ mod tests {
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
             "name  | score\n------+------\nAlice | 9    \nBob   | 8    \nCara  | 10   \n"
+        );
+    }
+
+    #[test]
+    fn parse_record_reuses_buffers_between_rows() {
+        let mut record = Record::default();
+        parse_record(
+            b"\"a \"\"long\"\" one\",second,third",
+            DEFAULT_DELIMITER,
+            &mut record,
+        )
+        .unwrap();
+        parse_record(b"x,\"y\"", DEFAULT_DELIMITER, &mut record).unwrap();
+        assert_eq!(values(&record), ["x", "y"]);
+        assert!(!record.quoted(0));
+        assert!(record.quoted(1));
+    }
+
+    #[test]
+    fn run_tail_wraps_ring_buffer() {
+        let input = b"n,v\n1,a\n2,b\n3,c\n4,d\n5,e\n";
+        for (extra, expected) in [
+            (&[][..], "n,v\n4,d\n5,e\n"),
+            (&["-s", "v"][..], "v\nd\ne\n"),
+        ] {
+            let mut argv = vec!["zsv", "--tail", "2"];
+            argv.extend_from_slice(extra);
+            assert_eq!(run_ok(&argv, input), expected);
+        }
+    }
+
+    #[test]
+    fn write_field_escapes_every_quote() {
+        let mut out = Vec::new();
+        write_field(&mut out, b"\"", DEFAULT_DELIMITER).unwrap();
+        assert_eq!(out, b"\"\"\"\"");
+        let mut out = Vec::new();
+        write_field(&mut out, b"\"a\"\"b\"", DEFAULT_DELIMITER).unwrap();
+        assert_eq!(out, b"\"\"\"a\"\"\"\"b\"\"\"");
+    }
+
+    fn run_ok(argv: &[&str], input: &[u8]) -> String {
+        let mut stdin = input;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run(&args(argv), &mut stdin, &mut stdout, &mut stderr).unwrap();
+        String::from_utf8(stdout).unwrap()
+    }
+
+    #[test]
+    fn run_rank_ties_keep_earliest_rows() {
+        let input = b"name,score\nA,5\nB,5\nC,6\nD,5\n";
+        assert_eq!(
+            run_ok(
+                &["zsv", "--greatest", "score", "-n", "2", "-s", "name"],
+                input
+            ),
+            "name\nC\nA\n"
+        );
+        assert_eq!(
+            run_ok(&["zsv", "--least", "score", "-n", "2", "-s", "name"], input),
+            "name\nA\nB\n"
+        );
+    }
+
+    #[test]
+    fn run_rank_many_rows() {
+        let mut input = b"id,v\n".to_vec();
+        for i in 0..1000u32 {
+            input.extend_from_slice(format!("{i},{}\n", (i * 37) % 1000).as_bytes());
+        }
+        assert_eq!(
+            run_ok(
+                &[
+                    "zsv",
+                    "--greatest",
+                    "v",
+                    "-n",
+                    "5",
+                    "-s",
+                    "v",
+                    "--no-header"
+                ],
+                &input
+            ),
+            "999\n998\n997\n996\n995\n"
+        );
+        assert_eq!(
+            run_ok(
+                &["zsv", "--least", "v", "-n", "3", "-s", "v", "--no-header"],
+                &input
+            ),
+            "0\n1\n2\n"
+        );
+    }
+
+    #[test]
+    fn run_grouped_agg_first_seen_order_and_taint() {
+        let input = b"dept,salary\nops,1\neng,2\nops,x\nhr,4\neng,3\n";
+        let mut stdin = &input[..];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run(
+            &args(&[
+                "zsv",
+                "--group-by",
+                "dept",
+                "--agg",
+                "count",
+                "--agg",
+                "sum:salary",
+            ]),
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "dept,count,sum(salary)\nops,2,\neng,2,5\nhr,1,4\n"
+        );
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "Warning: sum(salary): non-numeric values encountered\n"
+        );
+    }
+
+    #[test]
+    fn run_rank_mixed_numeric_and_text_keys() {
+        let input = b"name,score\na,1x\nb,2\nc,10\nd,3\ne,5\n";
+        assert_eq!(
+            run_ok(
+                &["zsv", "--greatest", "score", "-n", "4", "-s", "name"],
+                input
+            ),
+            "name\nc\ne\nd\nb\n"
+        );
+        assert_eq!(
+            run_ok(&["zsv", "--least", "score", "-n", "4", "-s", "name"], input),
+            "name\nb\nd\ne\nc\n"
+        );
+        assert_eq!(
+            run_ok(&["zsv", "--least", "score", "-n", "5", "-s", "name"], input),
+            "name\nb\nd\ne\nc\na\n"
+        );
+        let reversed = b"name,score\ne,5\nd,3\nc,10\nb,2\na,1x\n";
+        assert_eq!(
+            run_ok(
+                &["zsv", "--greatest", "score", "-n", "4", "-s", "name"],
+                reversed
+            ),
+            "name\nc\ne\nd\nb\n"
+        );
+    }
+
+    #[test]
+    fn run_rank_nan_key_does_not_panic() {
+        let input = b"name,v\na,NaN\nb,1\nc,2\n";
+        // total_cmp puts positive NaN above every finite value.
+        assert_eq!(
+            run_ok(&["zsv", "--greatest", "v", "-n", "3", "-s", "name"], input),
+            "name\na\nc\nb\n"
         );
     }
 }
