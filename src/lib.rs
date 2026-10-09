@@ -1922,18 +1922,28 @@ fn display_width(bytes: &[u8]) -> usize {
     width
 }
 
+fn write_repeated<W: Write>(writer: &mut W, byte: u8, count: usize) -> CliResult<()> {
+    let chunk = [byte; 64];
+    let mut remaining = count;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        writer.write_all(&chunk[..n])?;
+        remaining -= n;
+    }
+    Ok(())
+}
+
 fn write_field<W: Write>(writer: &mut W, field: &[u8], delimiter: u8) -> CliResult<()> {
     let needs_quoting = field
         .iter()
         .any(|&c| c == b'"' || c == b'\n' || c == b'\r' || c == delimiter);
     if needs_quoting {
         writer.write_all(b"\"")?;
-        for &c in field {
-            if c == b'"' {
+        for (i, part) in field.split(|&c| c == b'"').enumerate() {
+            if i > 0 {
                 writer.write_all(b"\"\"")?;
-            } else {
-                writer.write_all(&[c])?;
             }
+            writer.write_all(part)?;
         }
         writer.write_all(b"\"")?;
     } else {
@@ -2042,9 +2052,7 @@ fn write_table_separator<W: Write>(writer: &mut W, widths: &[usize]) -> CliResul
         if i > 0 {
             writer.write_all(b"-+-")?;
         }
-        for _ in 0..w {
-            writer.write_all(b"-")?;
-        }
+        write_repeated(writer, b'-', w)?;
     }
     writer.write_all(b"\n")?;
     Ok(())
@@ -2063,9 +2071,7 @@ fn write_table_row<W: Write>(
             }
             let val = fields.get(idx).map(Vec::as_slice).unwrap_or(b"");
             writer.write_all(val)?;
-            for _ in display_width(val)..widths[i] {
-                writer.write_all(b" ")?;
-            }
+            write_repeated(writer, b' ', widths[i].saturating_sub(display_width(val)))?;
         }
     } else {
         for (i, &w) in widths.iter().enumerate() {
@@ -2074,9 +2080,7 @@ fn write_table_row<W: Write>(
             }
             let val = fields.get(i).map(Vec::as_slice).unwrap_or(b"");
             writer.write_all(val)?;
-            for _ in display_width(val)..w {
-                writer.write_all(b" ")?;
-            }
+            write_repeated(writer, b' ', w.saturating_sub(display_width(val)))?;
         }
     }
     writer.write_all(b"\n")?;
@@ -2412,5 +2416,15 @@ mod tests {
             run(&args(&argv), &mut stdin, &mut stdout, &mut stderr).unwrap();
             assert_eq!(String::from_utf8(stdout).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn write_field_escapes_every_quote() {
+        let mut out = Vec::new();
+        write_field(&mut out, b"\"", DEFAULT_DELIMITER).unwrap();
+        assert_eq!(out, b"\"\"\"\"");
+        let mut out = Vec::new();
+        write_field(&mut out, b"\"a\"\"b\"", DEFAULT_DELIMITER).unwrap();
+        assert_eq!(out, b"\"\"\"a\"\"\"\"b\"\"\"");
     }
 }
