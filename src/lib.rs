@@ -192,14 +192,9 @@ impl Record {
 
     /// Copies the fields into `out`, reusing its existing buffers.
     fn copy_into(&self, out: &mut Vec<Vec<u8>>) {
-        out.truncate(self.len());
-        for (i, value) in self.values().enumerate() {
-            if let Some(slot) = out.get_mut(i) {
-                slot.clear();
-                slot.extend_from_slice(value);
-            } else {
-                out.push(value.to_vec());
-            }
+        out.resize_with(self.len(), Vec::new);
+        for (slot, value) in out.iter_mut().zip(self.values()) {
+            value.clone_into(slot);
         }
     }
 
@@ -1391,11 +1386,10 @@ fn rank_mode<R: Read, W: Write>(
             Ok(())
         })?;
     }
-    let mut ranked_rows: Vec<RankedRow> = heap.into_iter().map(|Reverse(row)| row).collect();
-    ranked_rows.sort_unstable_by(|a, b| b.cmp(a));
+    let ranked_rows = heap.into_sorted_vec();
     let rows: Vec<&[Vec<u8>]> = ranked_rows
         .iter()
-        .map(|row| row.fields.as_slice())
+        .map(|Reverse(row)| row.fields.as_slice())
         .collect();
     write_rows(
         writer,
@@ -2260,7 +2254,15 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         run(
-            &args(&["zsv", "--group-by", "dept", "--agg", "count", "--agg", "mean:salary"]),
+            &args(&[
+                "zsv",
+                "--group-by",
+                "dept",
+                "--agg",
+                "count",
+                "--agg",
+                "mean:salary",
+            ]),
             &mut stdin,
             &mut stdout,
             &mut stderr,
@@ -2435,11 +2437,7 @@ mod tests {
         ] {
             let mut argv = vec!["zsv", "--tail", "2"];
             argv.extend_from_slice(extra);
-            let mut stdin = &input[..];
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            run(&args(&argv), &mut stdin, &mut stdout, &mut stderr).unwrap();
-            assert_eq!(String::from_utf8(stdout).unwrap(), expected);
+            assert_eq!(run_ok(&argv, input), expected);
         }
     }
 
