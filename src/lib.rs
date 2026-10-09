@@ -148,10 +148,72 @@ struct Config {
     group_by: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Field {
-    value: Vec<u8>,
+/// One parsed CSV row. Field bytes (quotes stripped, `""` unescaped) are packed
+/// into `data`; reusing a `Record` across rows means parsing does not allocate.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Record {
+    data: Vec<u8>,
+    fields: Vec<FieldSpan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FieldSpan {
+    start: usize,
+    end: usize,
     quoted: bool,
+}
+
+impl Record {
+    fn clear(&mut self) {
+        self.data.clear();
+        self.fields.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    fn get(&self, i: usize) -> Option<&[u8]> {
+        self.fields.get(i).map(|f| &self.data[f.start..f.end])
+    }
+
+    fn quoted(&self, i: usize) -> bool {
+        self.fields.get(i).is_some_and(|f| f.quoted)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &[u8]> {
+        self.fields.iter().map(|f| &self.data[f.start..f.end])
+    }
+
+    fn to_vecs(&self) -> Vec<Vec<u8>> {
+        self.values().map(<[u8]>::to_vec).collect()
+    }
+
+    /// Copies the fields into `out`, reusing its existing buffers.
+    fn copy_into(&self, out: &mut Vec<Vec<u8>>) {
+        out.truncate(self.len());
+        for (i, value) in self.values().enumerate() {
+            if let Some(slot) = out.get_mut(i) {
+                slot.clear();
+                slot.extend_from_slice(value);
+            } else {
+                out.push(value.to_vec());
+            }
+        }
+    }
+
+    /// Closes the field whose bytes start at `start` and end at the current end of `data`.
+    fn end_field(&mut self, start: usize, quoted: bool) -> Result<(), ParseRecordError> {
+        if self.fields.len() >= MAX_FIELDS {
+            return Err(ParseRecordError::TooManyFields);
+        }
+        self.fields.push(FieldSpan {
+            start,
+            end: self.data.len(),
+            quoted,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -178,7 +240,7 @@ struct RankedRow {
     key_num: Option<f64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct SampleRow {
     fields: Vec<Vec<u8>>,
 }
@@ -189,12 +251,10 @@ struct InputSchema {
     cols: usize,
 }
 
-struct PendingLine {
-    line: Vec<u8>,
-}
-
 struct SourceState {
-    pending_first_data: Option<PendingLine>,
+    /// With --input-no-header the first line is data: `init_input_source` leaves it
+    /// in the line buffer and `read_data_line` returns it before reading more.
+    pending_first_data: bool,
     line_no: usize,
 }
 
@@ -215,15 +275,21 @@ impl TailBuffer {
         }
     }
 
-    fn append(&mut self, row: Vec<u8>) {
-        if self.count < self.capacity {
+    /// Returns the cleared buffer for the next row, evicting the oldest row when
+    /// full. Slots keep their capacity, so steady-state tailing does not allocate.
+    fn next_slot(&mut self) -> &mut Vec<u8> {
+        let idx = if self.count < self.capacity {
             let idx = (self.start + self.count) % self.capacity;
-            self.rows[idx] = row;
             self.count += 1;
+            idx
         } else {
-            self.rows[self.start] = row;
+            let idx = self.start;
             self.start = (self.start + 1) % self.capacity;
-        }
+            idx
+        };
+        let slot = &mut self.rows[idx];
+        slot.clear();
+        slot
     }
 
     fn flush<W: Write>(&self, writer: &mut W) -> CliResult<()> {
@@ -583,39 +649,33 @@ fn parse_agg(expr: &str) -> Option<Agg> {
     Some(Agg::new(func, field))
 }
 
-fn parse_record(line: &[u8], delimiter: u8) -> Result<Vec<Field>, ParseRecordError> {
-    let mut fields = Vec::new();
+fn parse_record(line: &[u8], delimiter: u8, record: &mut Record) -> Result<(), ParseRecordError> {
+    record.clear();
     let mut i = 0;
     while i <= line.len() {
+        let start = record.data.len();
         if i == line.len() {
             if line.last() == Some(&delimiter) {
-                push_field(&mut fields, Vec::new(), false)?;
+                record.end_field(start, false)?;
             }
             break;
         }
         if line[i] == b'"' {
             i += 1;
-            let mut value = Vec::new();
-            let mut closed = false;
-            while i < line.len() {
-                if line[i] == b'"' {
-                    if i + 1 < line.len() && line[i + 1] == b'"' {
-                        value.push(b'"');
-                        i += 2;
-                    } else {
-                        i += 1;
-                        closed = true;
-                        break;
-                    }
-                } else {
-                    value.push(line[i]);
+            loop {
+                let Some(q) = line[i..].iter().position(|&c| c == b'"') else {
+                    return Err(ParseRecordError::UnterminatedQuote);
+                };
+                record.data.extend_from_slice(&line[i..i + q]);
+                i += q + 1;
+                if line.get(i) == Some(&b'"') {
+                    record.data.push(b'"');
                     i += 1;
+                } else {
+                    break;
                 }
             }
-            if !closed {
-                return Err(ParseRecordError::UnterminatedQuote);
-            }
-            push_field(&mut fields, value, true)?;
+            record.end_field(start, true)?;
             if i == line.len() {
                 break;
             } else if line[i] == delimiter {
@@ -624,42 +684,30 @@ fn parse_record(line: &[u8], delimiter: u8) -> Result<Vec<Field>, ParseRecordErr
                 return Err(ParseRecordError::MalformedQuotedField);
             }
         } else {
-            let start = i;
-            while i < line.len() && line[i] != delimiter {
-                i += 1;
-            }
-            push_field(&mut fields, line[start..i].to_vec(), false)?;
-            if i < line.len() {
-                i += 1;
+            let end = line[i..]
+                .iter()
+                .position(|&c| c == delimiter)
+                .map_or(line.len(), |p| i + p);
+            record.data.extend_from_slice(&line[i..end]);
+            record.end_field(start, false)?;
+            if end < line.len() {
+                i = end + 1;
             } else {
                 break;
             }
         }
     }
-    Ok(fields)
-}
-
-fn push_field(
-    fields: &mut Vec<Field>,
-    value: Vec<u8>,
-    quoted: bool,
-) -> Result<(), ParseRecordError> {
-    if fields.len() >= MAX_FIELDS {
-        return Err(ParseRecordError::TooManyFields);
-    }
-    fields.push(Field { value, quoted });
     Ok(())
 }
 
-fn read_next_line<R: BufRead + ?Sized>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-) -> io::Result<Option<Vec<u8>>> {
+/// Reads the next non-empty line into `buf`, without its line terminator.
+/// Returns false at end of input.
+fn read_next_line<R: BufRead + ?Sized>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<bool> {
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', buf)?;
         if n == 0 {
-            return Ok(None);
+            return Ok(false);
         }
         if buf.len() > MAX_LINE_LEN {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
@@ -673,7 +721,7 @@ fn read_next_line<R: BufRead + ?Sized>(
         if buf.is_empty() {
             continue;
         }
-        return Ok(Some(buf.clone()));
+        return Ok(true);
     }
 }
 
@@ -681,16 +729,17 @@ fn read_data_line<R: BufRead + ?Sized>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     state: &mut SourceState,
-) -> io::Result<Option<Vec<u8>>> {
-    if let Some(pending) = state.pending_first_data.take() {
+) -> io::Result<bool> {
+    if state.pending_first_data {
+        state.pending_first_data = false;
         state.line_no += 1;
-        return Ok(Some(pending.line));
+        return Ok(true);
     }
-    let line = read_next_line(reader, buf)?;
-    if line.is_some() {
+    let found = read_next_line(reader, buf)?;
+    if found {
         state.line_no += 1;
     }
-    Ok(line)
+    Ok(found)
 }
 
 fn resolve_column_index(header: &[Vec<u8>], selector: &str) -> CliResult<usize> {
@@ -733,12 +782,12 @@ fn resolve_output_state(
     Ok(col_indices)
 }
 
-fn headers_match(expected: &[Vec<u8>], actual: &[Field]) -> bool {
+fn headers_match(expected: &[Vec<u8>], actual: &Record) -> bool {
     expected.len() == actual.len()
         && expected
             .iter()
-            .zip(actual)
-            .all(|(a, b)| a.as_slice() == b.value.as_slice())
+            .zip(actual.values())
+            .all(|(a, b)| a.as_slice() == b)
 }
 
 fn init_input_source<R: BufRead + ?Sized>(
@@ -747,13 +796,12 @@ fn init_input_source<R: BufRead + ?Sized>(
     config: &Config,
     schema: &mut InputSchema,
     buf: &mut Vec<u8>,
+    record: &mut Record,
 ) -> CliResult<Option<SourceState>> {
-    let first_line =
-        match read_next_line(reader, buf).map_err(|err| read_error(source_name, 1, err))? {
-            Some(line) => line,
-            None => return Ok(None),
-        };
-    let result = parse_record(&first_line, config.delimiter).map_err(|err| {
+    if !read_next_line(reader, buf).map_err(|err| read_error(source_name, 1, err))? {
+        return Ok(None);
+    }
+    parse_record(buf, config.delimiter, record).map_err(|err| {
         CliError::Message(format!(
             "Error parsing CSV in {source_name} on line 1: {}",
             err.message()
@@ -761,33 +809,33 @@ fn init_input_source<R: BufRead + ?Sized>(
     })?;
     if config.input_no_header {
         if schema.header.is_none() {
-            schema.cols = result.len();
-            schema.header = Some(make_synthetic_header(result.len()));
-        } else if result.len() != schema.cols {
+            schema.cols = record.len();
+            schema.header = Some(make_synthetic_header(record.len()));
+        } else if record.len() != schema.cols {
             return Err(CliError::Message(format!(
                 "Error: column count mismatch in {source_name}: expected {}, got {}",
                 schema.cols,
-                result.len()
+                record.len()
             )));
         }
         return Ok(Some(SourceState {
-            pending_first_data: Some(PendingLine { line: first_line }),
+            pending_first_data: true,
             line_no: 0,
         }));
     }
 
     if let Some(header) = &schema.header {
-        if !headers_match(header, &result) {
+        if !headers_match(header, record) {
             return Err(CliError::Message(format!(
                 "Error: header mismatch in {source_name}"
             )));
         }
     } else {
-        schema.cols = result.len();
-        schema.header = Some(result.into_iter().map(|f| f.value).collect());
+        schema.cols = record.len();
+        schema.header = Some(record.to_vecs());
     }
     Ok(Some(SourceState {
-        pending_first_data: None,
+        pending_first_data: false,
         line_no: 1,
     }))
 }
@@ -811,8 +859,9 @@ fn parse_row_for_source(
     config: &Config,
     source_name: &str,
     line_no: usize,
-) -> CliResult<Vec<Field>> {
-    parse_record(line, config.delimiter).map_err(|err| {
+    record: &mut Record,
+) -> CliResult<()> {
+    parse_record(line, config.delimiter, record).map_err(|err| {
         CliError::Message(format!(
             "Error parsing CSV in {source_name} on line {line_no}: {}",
             err.message()
@@ -946,21 +995,28 @@ fn validate_inputs<R: Read>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if row.len() != schema.cols {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if record.len() != schema.cols {
                     return Err(CliError::Message(format!(
                         "Error: column count mismatch in {source_name} on line {}: expected {}, got {}",
                         state.line_no,
                         schema.cols,
-                        row.len()
+                        record.len()
                     )));
                 }
                 rows_seen += 1;
@@ -986,21 +1042,28 @@ fn fast_pass_through<R: Read, W: Write>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
+            let mut record = Record::default();
             if config.input_no_header {
-                while let Some(line) = read_next_line(reader, &mut line_buf)
+                while read_next_line(reader, &mut line_buf)
                     .map_err(|err| read_error(source_name, rows_written + 1, err))?
                 {
                     if config.head.is_some_and(|limit| rows_written >= limit) {
                         break;
                     }
-                    write_raw_line_tail_aware(writer, tail.as_mut(), &line)?;
+                    write_raw_line_tail_aware(writer, tail.as_mut(), &line_buf)?;
                     rows_written += 1;
                 }
                 return Ok(());
             }
 
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, schema, &mut line_buf)?
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1013,13 +1076,13 @@ fn fast_pass_through<R: Read, W: Write>(
                 )?;
                 header_emitted = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
                 if config.head.is_some_and(|limit| rows_written >= limit) {
                     break;
                 }
-                write_raw_line_tail_aware(writer, tail.as_mut(), &line)?;
+                write_raw_line_tail_aware(writer, tail.as_mut(), &line_buf)?;
                 rows_written += 1;
             }
             Ok(())
@@ -1037,10 +1100,9 @@ fn write_raw_line_tail_aware<W: Write>(
     line: &[u8],
 ) -> CliResult<()> {
     if let Some(tail) = tail {
-        let mut row = Vec::with_capacity(line.len() + 1);
-        row.extend_from_slice(line);
-        row.push(b'\n');
-        tail.append(row);
+        let slot = tail.next_slot();
+        slot.extend_from_slice(line);
+        slot.push(b'\n');
     } else {
         writer.write_all(line)?;
         writer.write_all(b"\n")?;
@@ -1065,8 +1127,15 @@ fn csv_transform_mode<R: Read, W: Write>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1087,18 +1156,18 @@ fn csv_transform_mode<R: Read, W: Write>(
                 )?;
                 header_emitted = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
                 if config.head.is_some_and(|limit| rows_written >= limit) {
                     break;
                 }
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if passes_filters(&config.filters, &record) {
                     write_fields_tail_aware(
                         writer,
                         tail.as_mut(),
-                        &row,
+                        &record,
                         col_indices.as_deref(),
                         config.delimiter,
                     )?;
@@ -1117,16 +1186,14 @@ fn csv_transform_mode<R: Read, W: Write>(
 fn write_fields_tail_aware<W: Write>(
     writer: &mut W,
     tail: Option<&mut TailBuffer>,
-    row: &[Field],
+    record: &Record,
     col_indices: Option<&[usize]>,
     delimiter: u8,
 ) -> CliResult<()> {
     if let Some(tail) = tail {
-        let mut buf = Vec::new();
-        write_fields(&mut buf, row, col_indices, delimiter)?;
-        tail.append(buf);
+        write_fields(tail.next_slot(), record, col_indices, delimiter)?;
     } else {
-        write_fields(writer, row, col_indices, delimiter)?;
+        write_fields(writer, record, col_indices, delimiter)?;
     }
     Ok(())
 }
@@ -1149,8 +1216,15 @@ fn sample_mode<R: Read, W: Write>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1162,20 +1236,21 @@ fn sample_mode<R: Read, W: Write>(
                 )?;
                 ready = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
-                let cloned = clone_field_values(&row);
                 if reservoir.len() < sample_n {
-                    reservoir.push(SampleRow { fields: cloned });
+                    reservoir.push(SampleRow {
+                        fields: record.to_vecs(),
+                    });
                 } else {
                     let j = prng.range_less_than(rows_seen + 1);
                     if j < sample_n {
-                        reservoir[j] = SampleRow { fields: cloned };
+                        record.copy_into(&mut reservoir[j].fields);
                     }
                 }
                 rows_seen += 1;
@@ -1216,8 +1291,15 @@ fn rank_mode<R: Read, W: Write>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1233,18 +1315,18 @@ fn rank_mode<R: Read, W: Write>(
                 )?);
                 ready = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
                 let rank_idx = rank_col_index.unwrap();
-                let key = row.get(rank_idx).map(|f| f.value.as_slice()).unwrap_or(b"");
+                let key = record.get(rank_idx).unwrap_or(b"");
                 let key_num = parse_f64_bytes(key);
                 if ranked_rows.len() < limit {
-                    let fields = clone_field_values(&row);
+                    let fields = record.to_vecs();
                     let duped_key = fields.get(rank_idx).cloned().unwrap_or_default();
                     ranked_rows.push(RankedRow {
                         fields,
@@ -1262,7 +1344,7 @@ fn rank_mode<R: Read, W: Write>(
                         &worst.key,
                     ) == Ordering::Greater
                     {
-                        let fields = clone_field_values(&row);
+                        let fields = record.to_vecs();
                         let duped_key = fields.get(rank_idx).cloned().unwrap_or_default();
                         ranked_rows[wi] = RankedRow {
                             fields,
@@ -1312,8 +1394,15 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1333,16 +1422,16 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
                 fresh_aggs = config.aggs.clone();
                 ready = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
-                let key = row
+                let key = record
                     .get(group_col_index)
-                    .map(|f| f.value.clone())
+                    .map(<[u8]>::to_vec)
                     .unwrap_or_default();
                 let aggs = match groups.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -1355,8 +1444,8 @@ fn grouped_agg_mode<R: Read, W: Write, E: Write>(
                     if agg.count_all() {
                         agg.n += 1;
                     } else if let Some(col) = agg.col_index {
-                        if let Some(field) = row.get(col) {
-                            update_agg(agg, &field.value);
+                        if let Some(field) = record.get(col) {
+                            update_agg(agg, field);
                         }
                     }
                 }
@@ -1425,8 +1514,15 @@ fn agg_mode<R: Read, W: Write, E: Write>(
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1447,19 +1543,19 @@ fn agg_mode<R: Read, W: Write, E: Write>(
                 }
                 ready = true;
             }
-            while let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+            while read_data_line(reader, &mut line_buf, &mut state)
                 .map_err(|err| read_error(source_name, state.line_no + 1, err))?
             {
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
                 for agg in &mut config.aggs {
                     if agg.count_all() {
                         agg.n += 1;
                     } else if let Some(col) = agg.col_index {
-                        if let Some(field) = row.get(col) {
-                            update_agg(agg, &field.value);
+                        if let Some(field) = record.get(col) {
+                            update_agg(agg, field);
                         }
                     }
                 }
@@ -1509,12 +1605,20 @@ fn table_mode<R: Read, W: Write>(
     let mut buffered_rows: Vec<Vec<Vec<u8>>> = Vec::new();
     let mut sample_bytes = 0;
     let mut rows_written = 0;
+    let mut row_buf: Vec<Vec<u8>> = Vec::new();
 
     for input_path in input_paths {
         with_source(input_path, stdin, |reader, source_name| {
             let mut line_buf = Vec::with_capacity(MAX_LINE_LEN);
-            let Some(mut state) =
-                init_input_source(reader, source_name, config, &mut schema, &mut line_buf)?
+            let mut record = Record::default();
+            let Some(mut state) = init_input_source(
+                reader,
+                source_name,
+                config,
+                &mut schema,
+                &mut line_buf,
+                &mut record,
+            )?
             else {
                 return Ok(());
             };
@@ -1536,16 +1640,16 @@ fn table_mode<R: Read, W: Write>(
                     .head
                     .is_some_and(|limit| buffered_rows.len() >= limit)
             {
-                let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+                if !read_data_line(reader, &mut line_buf, &mut state)
                     .map_err(|err| read_error(source_name, state.line_no + 1, err))?
-                else {
+                {
                     break;
-                };
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if !passes_filters(&config.filters, &row) {
+                }
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if !passes_filters(&config.filters, &record) {
                     continue;
                 }
-                let cloned = clone_field_values(&row);
+                let cloned = record.to_vecs();
                 sample_bytes += cloned.iter().map(Vec::len).sum::<usize>();
                 update_widths(&mut widths, &cloned, col_indices.as_deref());
                 buffered_rows.push(cloned);
@@ -1571,15 +1675,15 @@ fn table_mode<R: Read, W: Write>(
             }
 
             while !config.head.is_some_and(|limit| rows_written >= limit) {
-                let Some(line) = read_data_line(reader, &mut line_buf, &mut state)
+                if !read_data_line(reader, &mut line_buf, &mut state)
                     .map_err(|err| read_error(source_name, state.line_no + 1, err))?
-                else {
+                {
                     break;
-                };
-                let row = parse_row_for_source(&line, config, source_name, state.line_no)?;
-                if passes_filters(&config.filters, &row) {
-                    let cloned = clone_field_values(&row);
-                    write_table_row(writer, &cloned, col_indices.as_deref(), &widths)?;
+                }
+                parse_row_for_source(&line_buf, config, source_name, state.line_no, &mut record)?;
+                if passes_filters(&config.filters, &record) {
+                    record.copy_into(&mut row_buf);
+                    write_table_row(writer, &row_buf, col_indices.as_deref(), &widths)?;
                     rows_written += 1;
                 }
             }
@@ -1624,27 +1728,22 @@ fn update_widths(widths: &mut [usize], row: &[Vec<u8>], col_indices: Option<&[us
     }
 }
 
-fn clone_field_values(row: &[Field]) -> Vec<Vec<u8>> {
-    row.iter().map(|field| field.value.clone()).collect()
+fn passes_filters(filters: &[Filter], record: &Record) -> bool {
+    filters.iter().all(|filter| evaluate_filter(filter, record))
 }
 
-fn passes_filters(filters: &[Filter], fields: &[Field]) -> bool {
-    filters.iter().all(|filter| evaluate_filter(filter, fields))
-}
-
-fn evaluate_filter(filter: &Filter, fields: &[Field]) -> bool {
+fn evaluate_filter(filter: &Filter, record: &Record) -> bool {
     let Some(col_index) = filter.col_index else {
         return true;
     };
-    let Some(field) = fields.get(col_index) else {
+    let Some(value) = record.get(col_index) else {
         return false;
     };
-    let field_val = String::from_utf8_lossy(&field.value);
     if filter.op == FilterOp::Like {
-        return glob_match(filter.value.as_bytes(), &field.value);
+        return glob_match(filter.value.as_bytes(), value);
     }
     if let Some(b) = filter.value_num {
-        let Ok(a) = field_val.parse::<f64>() else {
+        let Some(a) = parse_f64_bytes(value) else {
             return false;
         };
         return match filter.op {
@@ -1657,7 +1756,7 @@ fn evaluate_filter(filter: &Filter, fields: &[Field]) -> bool {
             FilterOp::Like => unreachable!(),
         };
     }
-    match field.value.as_slice().cmp(filter.value.as_bytes()) {
+    match value.cmp(filter.value.as_bytes()) {
         Ordering::Equal => matches!(filter.op, FilterOp::Eq | FilterOp::Lte | FilterOp::Gte),
         Ordering::Less => matches!(filter.op, FilterOp::Neq | FilterOp::Lt | FilterOp::Lte),
         Ordering::Greater => matches!(filter.op, FilterOp::Neq | FilterOp::Gt | FilterOp::Gte),
@@ -1872,15 +1971,18 @@ fn write_record<W: Write>(
 
 fn write_fields<W: Write>(
     writer: &mut W,
-    fields: &[Field],
+    record: &Record,
     col_indices: Option<&[usize]>,
     delimiter: u8,
 ) -> CliResult<()> {
-    let write_one = |writer: &mut W, field: &Field| -> CliResult<()> {
-        if field.quoted {
-            write_field(writer, &field.value, delimiter)
+    let write_one = |writer: &mut W, idx: usize| -> CliResult<()> {
+        let Some(value) = record.get(idx) else {
+            return Ok(());
+        };
+        if record.quoted(idx) {
+            write_field(writer, value, delimiter)
         } else {
-            writer.write_all(&field.value)?;
+            writer.write_all(value)?;
             Ok(())
         }
     };
@@ -1889,16 +1991,14 @@ fn write_fields<W: Write>(
             if i > 0 {
                 writer.write_all(&[delimiter])?;
             }
-            if let Some(field) = fields.get(idx) {
-                write_one(writer, field)?;
-            }
+            write_one(writer, idx)?;
         }
     } else {
-        for (i, field) in fields.iter().enumerate() {
-            if i > 0 {
+        for idx in 0..record.len() {
+            if idx > 0 {
                 writer.write_all(&[delimiter])?;
             }
-            write_one(writer, field)?;
+            write_one(writer, idx)?;
         }
     }
     writer.write_all(b"\n")?;
@@ -1991,45 +2091,50 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    fn values(row: &[Field]) -> Vec<String> {
-        row.iter()
-            .map(|f| String::from_utf8_lossy(&f.value).into_owned())
+    fn values(row: &Record) -> Vec<String> {
+        row.values()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
             .collect()
+    }
+
+    fn parse(line: &[u8], delimiter: u8) -> Result<Record, ParseRecordError> {
+        let mut record = Record::default();
+        parse_record(line, delimiter, &mut record).map(|()| record)
     }
 
     #[test]
     fn parse_record_simple_unquoted_fields() {
-        let row = parse_record(b"alice,30,Engineering", DEFAULT_DELIMITER).unwrap();
+        let row = parse(b"alice,30,Engineering", DEFAULT_DELIMITER).unwrap();
         assert_eq!(values(&row), ["alice", "30", "Engineering"]);
     }
 
     #[test]
     fn parse_record_empty_fields() {
-        let row = parse_record(b",a,,b,", DEFAULT_DELIMITER).unwrap();
+        let row = parse(b",a,,b,", DEFAULT_DELIMITER).unwrap();
         assert_eq!(values(&row), ["", "a", "", "b", ""]);
     }
 
     #[test]
     fn parse_record_quoted_and_escaped() {
-        let row = parse_record(b"\"she said \"\"hi\"\"\",ok", DEFAULT_DELIMITER).unwrap();
+        let row = parse(b"\"she said \"\"hi\"\"\",ok", DEFAULT_DELIMITER).unwrap();
         assert_eq!(values(&row), ["she said \"hi\"", "ok"]);
-        assert!(row[0].quoted);
+        assert!(row.quoted(0));
     }
 
     #[test]
     fn parse_record_custom_delimiter() {
-        let row = parse_record(b"alice\t\"sales, west\"\t42", b'\t').unwrap();
+        let row = parse(b"alice\t\"sales, west\"\t42", b'\t').unwrap();
         assert_eq!(values(&row), ["alice", "sales, west", "42"]);
     }
 
     #[test]
     fn parse_record_errors() {
         assert_eq!(
-            parse_record(b"\"x\"oops,2", DEFAULT_DELIMITER),
+            parse(b"\"x\"oops,2", DEFAULT_DELIMITER),
             Err(ParseRecordError::MalformedQuotedField)
         );
         assert_eq!(
-            parse_record(b"\"abc,def", DEFAULT_DELIMITER),
+            parse(b"\"abc,def", DEFAULT_DELIMITER),
             Err(ParseRecordError::UnterminatedQuote)
         );
         let mut line = Vec::new();
@@ -2040,7 +2145,7 @@ mod tests {
             line.push(b'x');
         }
         assert_eq!(
-            parse_record(&line, DEFAULT_DELIMITER),
+            parse(&line, DEFAULT_DELIMITER),
             Err(ParseRecordError::TooManyFields)
         );
     }
@@ -2163,7 +2268,7 @@ mod tests {
 
     #[test]
     fn evaluate_filter_numeric_and_string() {
-        let fields = parse_record(b"Alice,150000,Engineering", DEFAULT_DELIMITER).unwrap();
+        let fields = parse(b"Alice,150000,Engineering", DEFAULT_DELIMITER).unwrap();
         let mut f = parse_filter("salary>100000").unwrap();
         f.col_index = Some(1);
         assert!(evaluate_filter(&f, &fields));
@@ -2275,5 +2380,37 @@ mod tests {
             String::from_utf8(stdout).unwrap(),
             "name  | score\n------+------\nAlice | 9    \nBob   | 8    \nCara  | 10   \n"
         );
+    }
+
+    #[test]
+    fn parse_record_reuses_buffers_between_rows() {
+        let mut record = Record::default();
+        parse_record(
+            b"\"a \"\"long\"\" one\",second,third",
+            DEFAULT_DELIMITER,
+            &mut record,
+        )
+        .unwrap();
+        parse_record(b"x,\"y\"", DEFAULT_DELIMITER, &mut record).unwrap();
+        assert_eq!(values(&record), ["x", "y"]);
+        assert!(!record.quoted(0));
+        assert!(record.quoted(1));
+    }
+
+    #[test]
+    fn run_tail_wraps_ring_buffer() {
+        let input = b"n,v\n1,a\n2,b\n3,c\n4,d\n5,e\n";
+        for (extra, expected) in [
+            (&[][..], "n,v\n4,d\n5,e\n"),
+            (&["-s", "v"][..], "v\nd\ne\n"),
+        ] {
+            let mut argv = vec!["zsv", "--tail", "2"];
+            argv.extend_from_slice(extra);
+            let mut stdin = &input[..];
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            run(&args(&argv), &mut stdin, &mut stdout, &mut stderr).unwrap();
+            assert_eq!(String::from_utf8(stdout).unwrap(), expected);
+        }
     }
 }
